@@ -1,0 +1,22 @@
+# Configuracion local con credenciales
+/huawei-cgn-go
+*.env
+
+# Binarios y artefactos de Go
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+
+# Datos generados por el collector
+*.done
+*.part
+*.raw
+raw/
+
+# Archivos del sistema y editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
