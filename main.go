@@ -29,6 +29,9 @@ const (
 	generalHeaderSize = 16
 	recordSize        = 64
 	maxUDPPacketSize  = 65535
+	rawFormatBinary   = "binary"
+	rawFormatJSONL    = "jsonl"
+	rawBinaryMagic    = "HCGNRAW2\n"
 )
 
 var peruTZ = time.FixedZone("PET", -5*60*60)
@@ -71,6 +74,12 @@ type UDPPacket struct {
 	ReceivedUnixNano int64
 }
 
+type UDPReadResult struct {
+	Data       []byte
+	RouterIP   string
+	RouterPort uint16
+}
+
 type InsertBatch struct {
 	Body []byte
 	Rows int
@@ -85,6 +94,7 @@ var (
 	insertURL       string
 
 	rawSpoolBase string
+	rawFormat    string
 
 	maxPacketsPerFile   int
 	minPacketsPerFile   int
@@ -107,10 +117,27 @@ var (
 	insertRetryMS       int
 	insertHTTPTimeoutS  int
 	udpReadBufferMB     int
+	udpReceivers        int
+	udpBatchSize        int
+	udpReusePort        bool
+
+	autoTuneEnabled              bool
+	autoTuneIntervalSeconds      int
+	autoTuneHighWatermarkPct     int
+	autoTuneCriticalWatermarkPct int
+	autoTuneMaxRawWriters        int
+	autoTuneMaxPacketWorkers     int
+	autoTuneMaxBatchBuilders     int
+	autoTuneMaxInsertWorkers     int
+
+	liveInsertOverloadPolicy        string
+	liveInsertQueueHighWatermarkPct int
+	liveInsertSendTimeoutMS         int
 
 	totalReceived          uint64
 	totalPacketProcessed   uint64
 	totalPacketQueueDrops  uint64
+	totalLiveInsertSkipped uint64
 	totalRawSpooled        uint64
 	totalParsed            uint64
 	totalInserted          uint64
@@ -120,6 +147,11 @@ var (
 	totalInsertErrors      uint64
 	totalInsertDroppedRows uint64
 	totalBatchesInserted   uint64
+
+	currentRawWriters    int64
+	currentPacketWorkers int64
+	currentBatchBuilders int64
+	currentInsertWorkers int64
 )
 
 var packetBuffer512Pool = sync.Pool{
@@ -175,6 +207,74 @@ func getEnvInt(key string, defaultValue int) int {
 	}
 
 	return number
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return defaultValue
+	}
+
+	switch value {
+	case "1", "true", "yes", "y", "on", "si", "s":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		log.Printf("invalid_env_bool key=%s value=%q default=%t", key, value, defaultValue)
+		return defaultValue
+	}
+}
+
+func queueUsagePct(length int, capacity int) int {
+	if capacity <= 0 {
+		return 0
+	}
+	return (length * 100) / capacity
+}
+
+func channelUsagePct[T any](channel <-chan T) int {
+	return queueUsagePct(len(channel), cap(channel))
+}
+
+func channelsLenCap[T any](channels []chan T) (int, int) {
+	totalLen := 0
+	totalCap := 0
+	for _, channel := range channels {
+		totalLen += len(channel)
+		totalCap += cap(channel)
+	}
+	return totalLen, totalCap
+}
+
+func channelsMaxUsagePct[T any](channels []chan T) int {
+	maxUsage := 0
+	for _, channel := range channels {
+		usage := channelUsagePct(channel)
+		if usage > maxUsage {
+			maxUsage = usage
+		}
+	}
+	return maxUsage
+}
+
+func scaleStep(current int, max int, critical bool) int {
+	if current >= max {
+		return 0
+	}
+
+	step := current / 2
+	if critical {
+		step = current
+	}
+	if step < 1 {
+		step = 1
+	}
+	remaining := max - current
+	if step > remaining {
+		step = remaining
+	}
+	return step
 }
 
 func protocolName(protocolID uint8) string {
@@ -445,7 +545,8 @@ func recoverRawSpool() {
 
 func newRawOpenFile(writerID int) (*os.File, *bufio.Writer, string, error) {
 	fileName := fmt.Sprintf(
-		"raw_w%02d_%s_%d.open",
+		"raw_%s_w%02d_%s_%d.open",
+		rawFormat,
 		writerID,
 		time.Now().Format("20060102_150405"),
 		time.Now().UnixNano(),
@@ -458,6 +559,14 @@ func newRawOpenFile(writerID int) (*os.File, *bufio.Writer, string, error) {
 	}
 
 	writer := bufio.NewWriterSize(file, rawWriterBufferMB*1024*1024)
+	if rawFormat == rawFormatBinary {
+		if _, err := writer.WriteString(rawBinaryMagic); err != nil {
+			_ = file.Close()
+			_ = os.Remove(filePath)
+			return nil, nil, "", err
+		}
+	}
+
 	return file, writer, filePath, nil
 }
 
@@ -508,6 +617,104 @@ func reportFatal(fatalErrors chan<- error, err error) {
 	}
 }
 
+func writeRawJSONLPacket(writer *bufio.Writer, packet UDPPacket) error {
+	data := packet.Buffer[:packet.Length]
+	rawPacket := RawPacketLog{
+		ReceivedTime: peruTimeFromUnixNano(packet.ReceivedUnixNano),
+		RouterIP:     packet.RouterIP,
+		RouterPort:   packet.RouterPort,
+		PacketSize:   uint16(packet.Length),
+		RawHex:       hex.EncodeToString(data),
+	}
+
+	rawJSON, err := json.Marshal(rawPacket)
+	if err != nil {
+		return err
+	}
+
+	rawJSON = append(rawJSON, '\n')
+	_, err = writer.Write(rawJSON)
+	return err
+}
+
+func writeRawBinaryPacket(writer *bufio.Writer, packet UDPPacket) error {
+	routerIP := []byte(packet.RouterIP)
+	if len(routerIP) > 65535 {
+		return fmt.Errorf("raw_binary_router_ip_too_long length=%d", len(routerIP))
+	}
+
+	data := packet.Buffer[:packet.Length]
+	if len(data) > 65535 {
+		return fmt.Errorf("raw_binary_packet_too_large length=%d", len(data))
+	}
+
+	recordLen := 8 + 2 + 2 + 2 + len(routerIP) + len(data)
+	var header [18]byte
+	binary.BigEndian.PutUint32(header[0:4], uint32(recordLen))
+	binary.BigEndian.PutUint64(header[4:12], uint64(packet.ReceivedUnixNano))
+	binary.BigEndian.PutUint16(header[12:14], packet.RouterPort)
+	binary.BigEndian.PutUint16(header[14:16], uint16(len(routerIP)))
+	binary.BigEndian.PutUint16(header[16:18], uint16(len(data)))
+
+	if _, err := writer.Write(header[:]); err != nil {
+		return err
+	}
+	if _, err := writer.Write(routerIP); err != nil {
+		return err
+	}
+	_, err := writer.Write(data)
+	return err
+}
+
+func writeRawPacket(writer *bufio.Writer, packet UDPPacket) error {
+	switch rawFormat {
+	case rawFormatBinary:
+		return writeRawBinaryPacket(writer, packet)
+	case rawFormatJSONL:
+		return writeRawJSONLPacket(writer, packet)
+	default:
+		return fmt.Errorf("unsupported_raw_format format=%s", rawFormat)
+	}
+}
+
+func skipLiveInsert() {
+	atomic.AddUint64(&totalPacketQueueDrops, 1)
+	atomic.AddUint64(&totalLiveInsertSkipped, 1)
+}
+
+func enqueueForLiveInsert(packet UDPPacket, parsedPackets chan UDPPacket) bool {
+	if liveInsertOverloadPolicy != "raw_only" {
+		parsedPackets <- packet
+		return true
+	}
+
+	if channelUsagePct(parsedPackets) >= liveInsertQueueHighWatermarkPct {
+		skipLiveInsert()
+		return false
+	}
+
+	if liveInsertSendTimeoutMS <= 0 {
+		select {
+		case parsedPackets <- packet:
+			return true
+		default:
+			skipLiveInsert()
+			return false
+		}
+	}
+
+	timer := time.NewTimer(time.Duration(liveInsertSendTimeoutMS) * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case parsedPackets <- packet:
+		return true
+	case <-timer.C:
+		skipLiveInsert()
+		return false
+	}
+}
+
 func closeEmptyRawFile(writerID int, file *os.File, writer *bufio.Writer, openPath string) {
 	if err := writer.Flush(); err != nil {
 		log.Printf("raw_empty_flush_error writer=%d file=%s error=%v", writerID, openPath, err)
@@ -523,7 +730,7 @@ func closeEmptyRawFile(writerID int, file *os.File, writer *bufio.Writer, openPa
 func rawSpoolWriter(
 	writerID int,
 	packets <-chan UDPPacket,
-	parsedPackets chan<- UDPPacket,
+	parsedPackets chan UDPPacket,
 	fatalErrors chan<- error,
 	wg *sync.WaitGroup,
 ) {
@@ -538,31 +745,15 @@ func rawSpoolWriter(
 	createdAt := time.Now()
 
 	for packet := range packets {
-		data := packet.Buffer[:packet.Length]
-		rawPacket := RawPacketLog{
-			ReceivedTime: peruTimeFromUnixNano(packet.ReceivedUnixNano),
-			RouterIP:     packet.RouterIP,
-			RouterPort:   packet.RouterPort,
-			PacketSize:   uint16(packet.Length),
-			RawHex:       hex.EncodeToString(data),
-		}
-
-		rawJSON, err := json.Marshal(rawPacket)
-		if err != nil {
+		if err := writeRawPacket(writer, packet); err != nil {
 			atomic.AddUint64(&totalRawMarshalErrors, 1)
 			log.Printf(
-				"raw_marshal_error writer=%d router_ip=%s packet_size=%d error=%v",
+				"raw_encode_error writer=%d router_ip=%s packet_size=%d error=%v",
 				writerID,
 				packet.RouterIP,
 				packet.Length,
 				err,
 			)
-			releasePacketBuffer(packet.Buffer)
-			continue
-		}
-		rawJSON = append(rawJSON, '\n')
-
-		if _, err := writer.Write(rawJSON); err != nil {
 			releasePacketBuffer(packet.Buffer)
 			reportFatal(
 				fatalErrors,
@@ -619,7 +810,9 @@ func rawSpoolWriter(
 			createdAt = time.Now()
 		}
 
-		parsedPackets <- packet
+		if !enqueueForLiveInsert(packet, parsedPackets) {
+			releasePacketBuffer(packet.Buffer)
+		}
 	}
 
 	if packetCount > 0 {
@@ -736,10 +929,15 @@ func batchBuilder(eventLines <-chan []byte, batches chan<- InsertBatch, wg *sync
 }
 
 func newHTTPClient() *http.Client {
+	maxWorkers := autoTuneMaxInsertWorkers
+	if !autoTuneEnabled {
+		maxWorkers = insertWorkers
+	}
+
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          insertWorkers * 4,
-		MaxIdleConnsPerHost:   insertWorkers * 2,
+		MaxIdleConns:          maxWorkers * 4,
+		MaxIdleConnsPerHost:   maxWorkers * 2,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: time.Duration(insertHTTPTimeoutS) * time.Second,
 		DisableCompression:    true,
@@ -834,7 +1032,7 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 
 func metricsLogger(
 	stop <-chan struct{},
-	spoolPackets <-chan UDPPacket,
+	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
 	eventLines <-chan []byte,
 	batches <-chan InsertBatch,
@@ -856,15 +1054,17 @@ func metricsLogger(
 			rawSpooled := atomic.LoadUint64(&totalRawSpooled)
 			parsed := atomic.LoadUint64(&totalParsed)
 			inserted := atomic.LoadUint64(&totalInserted)
+			spoolLen, spoolCap := channelsLenCap(spoolQueues)
 
 			log.Printf(
-				"metrics total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_event=%d/%d queue_batch=%d/%d",
+				"metrics total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_event=%d/%d queue_batch=%d/%d workers_raw=%d workers_packet=%d workers_batch=%d workers_insert=%d",
 				received,
 				processed,
 				rawSpooled,
 				parsed,
 				inserted,
 				atomic.LoadUint64(&totalPacketQueueDrops),
+				atomic.LoadUint64(&totalLiveInsertSkipped),
 				atomic.LoadUint64(&totalParseErrors),
 				atomic.LoadUint64(&totalRawMarshalErrors),
 				atomic.LoadUint64(&totalEventMarshalError),
@@ -876,14 +1076,18 @@ func metricsLogger(
 				rawSpooled-previousRawSpooled,
 				parsed-previousParsed,
 				inserted-previousInserted,
-				len(spoolPackets),
-				cap(spoolPackets),
+				spoolLen,
+				spoolCap,
 				len(packetChannel),
 				cap(packetChannel),
 				len(eventLines),
 				cap(eventLines),
 				len(batches),
 				cap(batches),
+				atomic.LoadInt64(&currentRawWriters),
+				atomic.LoadInt64(&currentPacketWorkers),
+				atomic.LoadInt64(&currentBatchBuilders),
+				atomic.LoadInt64(&currentInsertWorkers),
 			)
 
 			previousReceived = received
@@ -897,15 +1101,108 @@ func metricsLogger(
 	}
 }
 
+func autoTuneSupervisor(
+	stop <-chan struct{},
+	spoolQueues []chan UDPPacket,
+	packetChannel <-chan UDPPacket,
+	eventLines <-chan []byte,
+	insertBatches <-chan InsertBatch,
+	spawnRawWriters func(int),
+	spawnPacketWorkers func(int),
+	spawnBatchBuilders func(int),
+	spawnInsertWorkers func(int),
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	if !autoTuneEnabled {
+		return
+	}
+
+	ticker := time.NewTicker(time.Duration(autoTuneIntervalSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			rawUsage := channelsMaxUsagePct(spoolQueues)
+			packetUsage := channelUsagePct(packetChannel)
+			eventUsage := channelUsagePct(eventLines)
+			batchUsage := channelUsagePct(insertBatches)
+
+			if rawUsage >= autoTuneHighWatermarkPct {
+				current := int(atomic.LoadInt64(&currentRawWriters))
+				step := scaleStep(current, autoTuneMaxRawWriters, rawUsage >= autoTuneCriticalWatermarkPct)
+				if step > 0 {
+					spawnRawWriters(step)
+					log.Printf(
+						"auto_tune_scale component=raw_writers from=%d to=%d queue_raw_input_pct=%d",
+						current,
+						current+step,
+						rawUsage,
+					)
+				}
+			}
+
+			if packetUsage >= autoTuneHighWatermarkPct && eventUsage < autoTuneCriticalWatermarkPct {
+				current := int(atomic.LoadInt64(&currentPacketWorkers))
+				step := scaleStep(current, autoTuneMaxPacketWorkers, packetUsage >= autoTuneCriticalWatermarkPct)
+				if step > 0 {
+					spawnPacketWorkers(step)
+					log.Printf(
+						"auto_tune_scale component=packet_workers from=%d to=%d queue_packet_pct=%d queue_event_pct=%d",
+						current,
+						current+step,
+						packetUsage,
+						eventUsage,
+					)
+				}
+			}
+
+			if eventUsage >= autoTuneHighWatermarkPct {
+				current := int(atomic.LoadInt64(&currentBatchBuilders))
+				step := scaleStep(current, autoTuneMaxBatchBuilders, eventUsage >= autoTuneCriticalWatermarkPct)
+				if step > 0 {
+					spawnBatchBuilders(step)
+					log.Printf(
+						"auto_tune_scale component=batch_builders from=%d to=%d queue_event_pct=%d",
+						current,
+						current+step,
+						eventUsage,
+					)
+				}
+			}
+
+			if batchUsage >= autoTuneHighWatermarkPct {
+				current := int(atomic.LoadInt64(&currentInsertWorkers))
+				step := scaleStep(current, autoTuneMaxInsertWorkers, batchUsage >= autoTuneCriticalWatermarkPct)
+				if step > 0 {
+					spawnInsertWorkers(step)
+					log.Printf(
+						"auto_tune_scale component=insert_workers from=%d to=%d queue_batch_pct=%d",
+						current,
+						current+step,
+						batchUsage,
+					)
+				}
+			}
+
+		case <-stop:
+			return
+		}
+	}
+}
+
 func loadConfig() {
 	listenAddr = getEnv("LISTEN_ADDR", "0.0.0.0:9088")
 
 	clickhouseURL = getEnv("CLICKHOUSE_URL", "http://127.0.0.1:8123")
-	clickhouseUser = getEnv("CLICKHOUSE_USER", "default")
+	clickhouseUser = getEnv("CLICKHOUSE_USER", "admin")
 	clickhousePass = getEnv("CLICKHOUSE_PASS", "")
-	clickhouseTable = getEnv("CLICKHOUSE_TABLE", "cgnat.huawei_cgn_nat")
+	clickhouseTable = getEnv("CLICKHOUSE_TABLE", "cgnat.huawei_cgn_nat_v2")
 
 	rawSpoolBase = getEnv("RAW_SPOOL_BASE", "/index2/huawei-cgn-go/raw")
+	rawFormat = strings.ToLower(getEnv("RAW_SPOOL_FORMAT", rawFormatBinary))
 
 	maxPacketsPerFile = getEnvInt("MAX_EVENTS_PER_FILE", 250000)
 	minPacketsPerFile = getEnvInt("MIN_EVENTS_PER_FILE", 100000)
@@ -936,6 +1233,43 @@ func loadConfig() {
 	insertHTTPTimeoutS = getEnvInt("INSERT_HTTP_TIMEOUT_SECONDS", 180)
 
 	udpReadBufferMB = getEnvInt("UDP_READ_BUFFER_MB", 512)
+	udpReceivers = getEnvInt("UDP_RECEIVERS", 4)
+	udpBatchSize = getEnvInt("UDP_BATCH_SIZE", 64)
+	udpReusePort = getEnvBool("UDP_REUSEPORT", true)
+	if strings.TrimSpace(os.Getenv("RAW_WRITERS")) == "" && rawWriters < udpReceivers {
+		rawWriters = udpReceivers
+	}
+
+	autoTuneEnabled = getEnvBool("AUTO_TUNE", true)
+	autoTuneIntervalSeconds = getEnvInt("AUTO_TUNE_INTERVAL_SECONDS", 5)
+	autoTuneHighWatermarkPct = getEnvInt("AUTO_TUNE_HIGH_WATERMARK_PCT", 70)
+	autoTuneCriticalWatermarkPct = getEnvInt("AUTO_TUNE_CRITICAL_WATERMARK_PCT", 90)
+
+	defaultMaxRawWriters := rawWriters * 4
+	if defaultMaxRawWriters < rawWriters {
+		defaultMaxRawWriters = rawWriters
+	}
+	defaultMaxPacketWorkers := runtime.NumCPU() * 2
+	if defaultMaxPacketWorkers < packetWorkers {
+		defaultMaxPacketWorkers = packetWorkers
+	}
+	defaultMaxBatchBuilders := batchBuilders * 4
+	if defaultMaxBatchBuilders < batchBuilders {
+		defaultMaxBatchBuilders = batchBuilders
+	}
+	defaultMaxInsertWorkers := insertWorkers * 4
+	if defaultMaxInsertWorkers < insertWorkers {
+		defaultMaxInsertWorkers = insertWorkers
+	}
+
+	autoTuneMaxRawWriters = getEnvInt("AUTO_TUNE_MAX_RAW_WRITERS", defaultMaxRawWriters)
+	autoTuneMaxPacketWorkers = getEnvInt("AUTO_TUNE_MAX_PACKET_WORKERS", defaultMaxPacketWorkers)
+	autoTuneMaxBatchBuilders = getEnvInt("AUTO_TUNE_MAX_BATCH_BUILDERS", defaultMaxBatchBuilders)
+	autoTuneMaxInsertWorkers = getEnvInt("AUTO_TUNE_MAX_INSERT_WORKERS", defaultMaxInsertWorkers)
+
+	liveInsertOverloadPolicy = strings.ToLower(getEnv("LIVE_INSERT_OVERLOAD_POLICY", "raw_only"))
+	liveInsertQueueHighWatermarkPct = getEnvInt("LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT", 95)
+	liveInsertSendTimeoutMS = getEnvInt("LIVE_INSERT_SEND_TIMEOUT_MS", 1)
 
 	query := fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", clickhouseTable)
 	insertURL = strings.TrimRight(clickhouseURL, "/") + "/?query=" + url.QueryEscape(query)
@@ -943,26 +1277,33 @@ func loadConfig() {
 
 func validateConfig() {
 	positiveValues := map[string]int{
-		"MAX_EVENTS_PER_FILE":         maxPacketsPerFile,
-		"MIN_EVENTS_PER_FILE":         minPacketsPerFile,
-		"ROTATE_SECONDS":              rotateSeconds,
-		"FORCE_ROTATE_SECONDS":        forceRotateSeconds,
-		"RAW_WRITER_BUFFER_MB":        rawWriterBufferMB,
-		"PACKET_WORKERS":              packetWorkers,
-		"PACKET_CHANNEL_SIZE":         packetChannelSize,
-		"RAW_WRITERS":                 rawWriters,
-		"RAW_CHANNEL_SIZE":            rawChannelSize,
-		"EVENT_CHANNEL_SIZE":          eventChannelSize,
-		"INSERT_WORKERS":              insertWorkers,
-		"BATCH_BUILDERS":              batchBuilders,
-		"INSERT_BATCH_ROWS":           insertBatchRows,
-		"INSERT_BATCH_BYTES":          insertBatchBytes,
-		"INSERT_FLUSH_MS":             insertFlushMS,
-		"INSERT_BATCH_CHANNEL_SIZE":   insertBatchChanSize,
-		"INSERT_MAX_RETRIES":          insertMaxRetries,
-		"INSERT_RETRY_MS":             insertRetryMS,
-		"INSERT_HTTP_TIMEOUT_SECONDS": insertHTTPTimeoutS,
-		"UDP_READ_BUFFER_MB":          udpReadBufferMB,
+		"MAX_EVENTS_PER_FILE":          maxPacketsPerFile,
+		"MIN_EVENTS_PER_FILE":          minPacketsPerFile,
+		"ROTATE_SECONDS":               rotateSeconds,
+		"FORCE_ROTATE_SECONDS":         forceRotateSeconds,
+		"RAW_WRITER_BUFFER_MB":         rawWriterBufferMB,
+		"PACKET_WORKERS":               packetWorkers,
+		"PACKET_CHANNEL_SIZE":          packetChannelSize,
+		"RAW_WRITERS":                  rawWriters,
+		"RAW_CHANNEL_SIZE":             rawChannelSize,
+		"EVENT_CHANNEL_SIZE":           eventChannelSize,
+		"INSERT_WORKERS":               insertWorkers,
+		"BATCH_BUILDERS":               batchBuilders,
+		"INSERT_BATCH_ROWS":            insertBatchRows,
+		"INSERT_BATCH_BYTES":           insertBatchBytes,
+		"INSERT_FLUSH_MS":              insertFlushMS,
+		"INSERT_BATCH_CHANNEL_SIZE":    insertBatchChanSize,
+		"INSERT_MAX_RETRIES":           insertMaxRetries,
+		"INSERT_RETRY_MS":              insertRetryMS,
+		"INSERT_HTTP_TIMEOUT_SECONDS":  insertHTTPTimeoutS,
+		"UDP_READ_BUFFER_MB":           udpReadBufferMB,
+		"UDP_RECEIVERS":                udpReceivers,
+		"UDP_BATCH_SIZE":               udpBatchSize,
+		"AUTO_TUNE_INTERVAL_SECONDS":   autoTuneIntervalSeconds,
+		"AUTO_TUNE_MAX_RAW_WRITERS":    autoTuneMaxRawWriters,
+		"AUTO_TUNE_MAX_PACKET_WORKERS": autoTuneMaxPacketWorkers,
+		"AUTO_TUNE_MAX_BATCH_BUILDERS": autoTuneMaxBatchBuilders,
+		"AUTO_TUNE_MAX_INSERT_WORKERS": autoTuneMaxInsertWorkers,
 	}
 
 	for key, value := range positiveValues {
@@ -978,6 +1319,117 @@ func validateConfig() {
 	if syncEveryPackets < 0 {
 		log.Fatal("SYNC_EVERY_EVENTS cannot be negative")
 	}
+
+	switch rawFormat {
+	case rawFormatBinary, rawFormatJSONL:
+	default:
+		log.Fatal("RAW_SPOOL_FORMAT must be binary or jsonl")
+	}
+
+	if autoTuneHighWatermarkPct <= 0 || autoTuneHighWatermarkPct > 100 {
+		log.Fatal("AUTO_TUNE_HIGH_WATERMARK_PCT must be between 1 and 100")
+	}
+	if autoTuneCriticalWatermarkPct <= 0 || autoTuneCriticalWatermarkPct > 100 {
+		log.Fatal("AUTO_TUNE_CRITICAL_WATERMARK_PCT must be between 1 and 100")
+	}
+	if autoTuneCriticalWatermarkPct < autoTuneHighWatermarkPct {
+		log.Fatal("AUTO_TUNE_CRITICAL_WATERMARK_PCT cannot be lower than AUTO_TUNE_HIGH_WATERMARK_PCT")
+	}
+
+	if autoTuneMaxRawWriters < rawWriters {
+		log.Fatal("AUTO_TUNE_MAX_RAW_WRITERS cannot be lower than RAW_WRITERS")
+	}
+	if autoTuneMaxPacketWorkers < packetWorkers {
+		log.Fatal("AUTO_TUNE_MAX_PACKET_WORKERS cannot be lower than PACKET_WORKERS")
+	}
+	if autoTuneMaxBatchBuilders < batchBuilders {
+		log.Fatal("AUTO_TUNE_MAX_BATCH_BUILDERS cannot be lower than BATCH_BUILDERS")
+	}
+	if autoTuneMaxInsertWorkers < insertWorkers {
+		log.Fatal("AUTO_TUNE_MAX_INSERT_WORKERS cannot be lower than INSERT_WORKERS")
+	}
+
+	switch liveInsertOverloadPolicy {
+	case "block", "raw_only":
+	default:
+		log.Fatal("LIVE_INSERT_OVERLOAD_POLICY must be block or raw_only")
+	}
+	if liveInsertQueueHighWatermarkPct <= 0 || liveInsertQueueHighWatermarkPct > 100 {
+		log.Fatal("LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT must be between 1 and 100")
+	}
+	if liveInsertSendTimeoutMS < 0 {
+		log.Fatal("LIVE_INSERT_SEND_TIMEOUT_MS cannot be negative")
+	}
+}
+
+func makeSpoolQueues(count int, queueSize int) []chan UDPPacket {
+	queues := make([]chan UDPPacket, count)
+	for index := range queues {
+		queues[index] = make(chan UDPPacket, queueSize)
+	}
+	return queues
+}
+
+func closeUDPReceivers(receivers []*udpReceiver) {
+	for _, receiver := range receivers {
+		if receiver != nil {
+			_ = receiver.Close()
+		}
+	}
+}
+
+func udpReadLoop(
+	receiverID int,
+	receiver *udpReceiver,
+	spoolQueue chan<- UDPPacket,
+	stop <-chan struct{},
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	results := make([]UDPReadResult, udpBatchSize)
+
+	for {
+		count, err := receiver.ReadBatch(results)
+		if err != nil {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			log.Printf("udp_read_error receiver=%d error=%v", receiverID, err)
+			continue
+		}
+
+		receivedAt := time.Now().UnixNano()
+		for index := 0; index < count; index++ {
+			result := results[index]
+			bytesRead := len(result.Data)
+			if bytesRead == 0 {
+				continue
+			}
+
+			atomic.AddUint64(&totalReceived, 1)
+
+			packetBuffer := acquirePacketBuffer(bytesRead)
+			copy(packetBuffer, result.Data)
+
+			packet := UDPPacket{
+				Buffer:           packetBuffer,
+				Length:           bytesRead,
+				RouterIP:         result.RouterIP,
+				RouterPort:       result.RouterPort,
+				ReceivedUnixNano: receivedAt,
+			}
+
+			select {
+			case spoolQueue <- packet:
+			case <-stop:
+				releasePacketBuffer(packetBuffer)
+				return
+			}
+		}
+	}
 }
 
 func main() {
@@ -989,27 +1441,25 @@ func main() {
 	}
 	recoverRawSpool()
 
-	udpAddress, err := net.ResolveUDPAddr("udp", listenAddr)
-	if err != nil {
-		log.Fatalf("resolve_udp_error address=%s error=%v", listenAddr, err)
-	}
-
-	connection, err := net.ListenUDP("udp", udpAddress)
-	if err != nil {
-		log.Fatalf("listen_udp_error address=%s error=%v", listenAddr, err)
-	}
-	defer connection.Close()
-
 	readBufferBytes := udpReadBufferMB * 1024 * 1024
-	if err := connection.SetReadBuffer(readBufferBytes); err != nil {
-		log.Printf(
-			"udp_set_read_buffer_warning requested_bytes=%d error=%v",
-			readBufferBytes,
-			err,
-		)
+	receivers := make([]*udpReceiver, 0, udpReceivers)
+	for receiverID := 1; receiverID <= udpReceivers; receiverID++ {
+		receiver, err := openUDPReceiver(listenAddr, udpReusePort, readBufferBytes, udpBatchSize)
+		if err != nil {
+			closeUDPReceivers(receivers)
+			log.Fatalf(
+				"listen_udp_error receiver=%d address=%s reuse_port=%t error=%v",
+				receiverID,
+				listenAddr,
+				udpReusePort,
+				err,
+			)
+		}
+		receivers = append(receivers, receiver)
 	}
+	defer closeUDPReceivers(receivers)
 
-	spoolPackets := make(chan UDPPacket, rawChannelSize)
+	spoolQueues := makeSpoolQueues(udpReceivers, rawChannelSize)
 	packetChannel := make(chan UDPPacket, packetChannelSize)
 	eventLines := make(chan []byte, eventChannelSize)
 	insertBatches := make(chan InsertBatch, insertBatchChanSize)
@@ -1021,9 +1471,7 @@ func main() {
 		stopOnce.Do(func() {
 			log.Printf("collector_shutdown_requested reason=%s", reason)
 			close(stop)
-			if err := connection.Close(); err != nil {
-				log.Printf("udp_close_error error=%v", err)
-			}
+			closeUDPReceivers(receivers)
 		})
 	}
 
@@ -1042,39 +1490,83 @@ func main() {
 		}
 	}()
 
+	var readWG sync.WaitGroup
 	var rawWG sync.WaitGroup
 	var packetWG sync.WaitGroup
 	var batchWG sync.WaitGroup
 	var insertWG sync.WaitGroup
+	var autoTuneWG sync.WaitGroup
+	var nextRawQueue uint64
 
-	for writerID := 1; writerID <= rawWriters; writerID++ {
-		rawWG.Add(1)
-		go rawSpoolWriter(writerID, spoolPackets, packetChannel, fatalErrors, &rawWG)
+	spawnRawWriters := func(count int) {
+		for range count {
+			writerID := int(atomic.AddInt64(&currentRawWriters, 1))
+			queueIndex := int(atomic.AddUint64(&nextRawQueue, 1)-1) % len(spoolQueues)
+			rawWG.Add(1)
+			go rawSpoolWriter(writerID, spoolQueues[queueIndex], packetChannel, fatalErrors, &rawWG)
+		}
 	}
 
-	for workerID := 1; workerID <= packetWorkers; workerID++ {
-		packetWG.Add(1)
-		go packetWorker(workerID, packetChannel, eventLines, &packetWG)
+	spawnPacketWorkers := func(count int) {
+		for range count {
+			workerID := int(atomic.AddInt64(&currentPacketWorkers, 1))
+			packetWG.Add(1)
+			go packetWorker(workerID, packetChannel, eventLines, &packetWG)
+		}
 	}
 
-	for builderID := 1; builderID <= batchBuilders; builderID++ {
-		batchWG.Add(1)
-		go batchBuilder(eventLines, insertBatches, &batchWG)
+	spawnBatchBuilders := func(count int) {
+		for range count {
+			atomic.AddInt64(&currentBatchBuilders, 1)
+			batchWG.Add(1)
+			go batchBuilder(eventLines, insertBatches, &batchWG)
+		}
 	}
 
-	for workerID := 1; workerID <= insertWorkers; workerID++ {
-		insertWG.Add(1)
-		go insertWorker(workerID, insertBatches, &insertWG)
+	spawnInsertWorkers := func(count int) {
+		for range count {
+			workerID := int(atomic.AddInt64(&currentInsertWorkers, 1))
+			insertWG.Add(1)
+			go insertWorker(workerID, insertBatches, &insertWG)
+		}
 	}
 
-	go metricsLogger(stop, spoolPackets, packetChannel, eventLines, insertBatches)
+	spawnRawWriters(rawWriters)
+	spawnPacketWorkers(packetWorkers)
+	spawnBatchBuilders(batchBuilders)
+	spawnInsertWorkers(insertWorkers)
+
+	for receiverIndex, receiver := range receivers {
+		readWG.Add(1)
+		go udpReadLoop(receiverIndex+1, receiver, spoolQueues[receiverIndex], stop, &readWG)
+	}
+
+	go metricsLogger(stop, spoolQueues, packetChannel, eventLines, insertBatches)
+
+	autoTuneWG.Add(1)
+	go autoTuneSupervisor(
+		stop,
+		spoolQueues,
+		packetChannel,
+		eventLines,
+		insertBatches,
+		spawnRawWriters,
+		spawnPacketWorkers,
+		spawnBatchBuilders,
+		spawnInsertWorkers,
+		&autoTuneWG,
+	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s raw_spool=%s packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size=%d event_channel_size=%d batch_builders=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d udp_read_buffer_mb=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d event_channel_size=%d batch_builders=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
 		rawSpoolBase,
+		rawFormat,
+		udpReceivers,
+		udpReusePort,
+		udpBatchSize,
 		packetWorkers,
 		packetChannelSize,
 		rawWriters,
@@ -1085,46 +1577,21 @@ func main() {
 		insertBatchRows,
 		insertBatchBytes,
 		udpReadBufferMB,
+		autoTuneEnabled,
+		autoTuneMaxRawWriters,
+		autoTuneMaxPacketWorkers,
+		autoTuneMaxBatchBuilders,
+		autoTuneMaxInsertWorkers,
+		liveInsertOverloadPolicy,
+		liveInsertQueueHighWatermarkPct,
 	)
 
-	readBuffer := make([]byte, maxUDPPacketSize)
-
-readLoop:
-	for {
-		bytesRead, remoteAddress, err := connection.ReadFromUDP(readBuffer)
-		if err != nil {
-			select {
-			case <-stop:
-				break readLoop
-			default:
-			}
-			log.Printf("udp_read_error error=%v", err)
-			continue
-		}
-
-		atomic.AddUint64(&totalReceived, 1)
-
-		packetBuffer := acquirePacketBuffer(bytesRead)
-		copy(packetBuffer, readBuffer[:bytesRead])
-
-		packet := UDPPacket{
-			Buffer:           packetBuffer,
-			Length:           bytesRead,
-			RouterIP:         remoteAddress.IP.String(),
-			RouterPort:       uint16(remoteAddress.Port),
-			ReceivedUnixNano: time.Now().UnixNano(),
-		}
-
-		select {
-		case spoolPackets <- packet:
-		case <-stop:
-			releasePacketBuffer(packetBuffer)
-			break readLoop
-		}
-	}
-
+	readWG.Wait()
 	log.Printf("collector_draining_start")
-	close(spoolPackets)
+	autoTuneWG.Wait()
+	for _, queue := range spoolQueues {
+		close(queue)
+	}
 	rawWG.Wait()
 	close(packetChannel)
 	packetWG.Wait()
