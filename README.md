@@ -5,9 +5,10 @@ paquetes RAW e insertar los eventos procesados en ClickHouse.
 
 El flujo de alto trafico en Linux usa varios sockets UDP con `SO_REUSEPORT`,
 recepcion por lotes con `recvmmsg`, colas RAW separadas por receptor, RAW
-binario configurable y workers adaptativos para parseo, armado de batches e
-insercion. La insercion live hacia ClickHouse usa `RowBinary` por HTTP para
-evitar el costo de `JSONEachRow` en el camino caliente.
+binario configurable y workers adaptativos para parseo e insercion. La
+insercion live hacia ClickHouse usa `RowBinary` por HTTP y los `PACKET_WORKERS`
+arman los batches directamente, sin una cola central de eventos, para evitar
+que `queue_event` sea el cuello de botella.
 
 ## Configuracion
 
@@ -31,7 +32,15 @@ Al arrancar, el log debe mostrar:
 
 ```text
 clickhouse_insert_format=RowBinary
+live_batch_mode=packet_worker_direct
 ```
+
+En esta version `BATCH_BUILDERS` y `EVENT_CHANNEL_SIZE` quedan aceptados por
+compatibilidad, pero ya no controlan el camino caliente. Para validar carga,
+mirar principalmente `queue_packet`, `queue_batch`, `total_live_insert_skipped`
+y `total_live_insert_skipped_rows`. Si ClickHouse no alcanza, el modo
+`LIVE_INSERT_OVERLOAD_POLICY=raw_only` conserva el RAW binario y salta la ruta
+live sin frenar la recepcion UDP.
 
 ## Simulador UDP
 

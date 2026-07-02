@@ -19,20 +19,24 @@ UDP_RECEIVERS=4
 UDP_REUSEPORT=true
 UDP_BATCH_SIZE=64
 
+PACKET_WORKERS=48
 PACKET_CHANNEL_SIZE=500000
 RAW_CHANNEL_SIZE=500000
+
+# Compatibilidad con versiones anteriores. En la version actual el batching
+# live es directo en PACKET_WORKERS, por eso no existe una queue_event central.
 EVENT_CHANNEL_SIZE=1000000
 
 RAW_WRITERS=4
 RAW_WRITER_BUFFER_MB=8
 
 BATCH_BUILDERS=4
-INSERT_WORKERS=4
+INSERT_WORKERS=6
 
-INSERT_BATCH_ROWS=250000
+INSERT_BATCH_ROWS=100000
 INSERT_BATCH_BYTES=67108864
-INSERT_FLUSH_MS=1000
-INSERT_BATCH_CHANNEL_SIZE=8
+INSERT_FLUSH_MS=5000
+INSERT_BATCH_CHANNEL_SIZE=64
 
 INSERT_MAX_RETRIES=3
 INSERT_RETRY_MS=500
@@ -45,12 +49,12 @@ AUTO_TUNE_INTERVAL_SECONDS=5
 AUTO_TUNE_HIGH_WATERMARK_PCT=70
 AUTO_TUNE_CRITICAL_WATERMARK_PCT=90
 AUTO_TUNE_MAX_RAW_WRITERS=8
-AUTO_TUNE_MAX_PACKET_WORKERS=144
+AUTO_TUNE_MAX_PACKET_WORKERS=72
 AUTO_TUNE_MAX_BATCH_BUILDERS=4
-AUTO_TUNE_MAX_INSERT_WORKERS=4
+AUTO_TUNE_MAX_INSERT_WORKERS=8
 
 # Protege la recepcion UDP si la insercion en vivo no alcanza.
-# raw_only guarda RAW y salta la ruta live cuando queue_packet esta en zona roja.
+# raw_only guarda RAW y salta la ruta live cuando queue_packet o queue_batch esta en zona roja.
 # block mantiene el comportamiento anterior: espera a la insercion live aunque pueda llenar el socket UDP.
 LIVE_INSERT_OVERLOAD_POLICY=raw_only
 LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT=95

@@ -148,6 +148,7 @@ var (
 	totalEventMarshalError uint64
 	totalInsertErrors      uint64
 	totalInsertDroppedRows uint64
+	totalLiveSkippedRows   uint64
 	totalBatchesInserted   uint64
 
 	currentRawWriters    int64
@@ -875,38 +876,90 @@ func rawSpoolWriter(
 func packetWorker(
 	workerID int,
 	packets <-chan UDPPacket,
-	events chan<- NATLogEntry,
+	batches chan InsertBatch,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
 
-	for packet := range packets {
-		data := packet.Buffer[:packet.Length]
+	flushTicker := time.NewTicker(time.Duration(insertFlushMS) * time.Millisecond)
+	defer flushTicker.Stop()
 
-		entries, err := parsePacket(
-			data,
-			packet.RouterIPNum,
-			packet.RouterPort,
-			packet.ReceivedUnixNano,
-		)
-		if err != nil {
-			atomic.AddUint64(&totalParseErrors, 1)
-			log.Printf(
-				"parse_error worker=%d router_ip=%s packet_size=%d error=%v",
-				workerID,
-				packet.RouterIP,
-				packet.Length,
-				err,
-			)
-		} else {
-			for _, entry := range entries {
-				events <- entry
-				atomic.AddUint64(&totalParsed, 1)
-			}
+	initialBatchCapacity := insertBatchBytes
+	if initialBatchCapacity > 1024*1024 {
+		initialBatchCapacity = 1024 * 1024
+	}
+
+	body := make([]byte, 0, initialBatchCapacity)
+	rows := 0
+
+	flush := func() {
+		if rows == 0 {
+			return
 		}
 
-		atomic.AddUint64(&totalPacketProcessed, 1)
-		releasePacketBuffer(packet.Buffer)
+		if sendInsertBatch(InsertBatch{Body: body, Rows: rows}, batches) {
+			body = make([]byte, 0, initialBatchCapacity)
+			rows = 0
+			return
+		}
+
+		atomic.AddUint64(&totalLiveSkippedRows, uint64(rows))
+		body = make([]byte, 0, initialBatchCapacity)
+		rows = 0
+	}
+
+	for {
+		select {
+		case packet, ok := <-packets:
+			if !ok {
+				flush()
+				return
+			}
+
+			data := packet.Buffer[:packet.Length]
+
+			entries, err := parsePacket(
+				data,
+				packet.RouterIPNum,
+				packet.RouterPort,
+				packet.ReceivedUnixNano,
+			)
+			if err != nil {
+				atomic.AddUint64(&totalParseErrors, 1)
+				log.Printf(
+					"parse_error worker=%d router_ip=%s packet_size=%d error=%v",
+					workerID,
+					packet.RouterIP,
+					packet.Length,
+					err,
+				)
+			} else {
+				for _, entry := range entries {
+					beforeLen := len(body)
+					var err error
+					body, err = appendRowBinaryEvent(body, entry)
+					if err != nil {
+						body = body[:beforeLen]
+						atomic.AddUint64(&totalEventMarshalError, 1)
+						log.Printf("event_rowbinary_error worker=%d event_id=%s error=%v", workerID, entry.EventID, err)
+						continue
+					}
+
+					rows++
+					atomic.AddUint64(&totalParsed, 1)
+
+					if rows >= insertBatchRows || len(body) >= insertBatchBytes {
+						flush()
+					}
+				}
+			}
+
+			atomic.AddUint64(&totalPacketProcessed, 1)
+			releasePacketBuffer(packet.Buffer)
+
+		case <-flushTicker.C:
+			flush()
+		}
 	}
 }
 
@@ -937,55 +990,37 @@ func appendRowBinaryEvent(buffer []byte, entry NATLogEntry) ([]byte, error) {
 	return buffer, nil
 }
 
-func batchBuilder(events <-chan NATLogEntry, batches chan<- InsertBatch, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	flushTicker := time.NewTicker(time.Duration(insertFlushMS) * time.Millisecond)
-	defer flushTicker.Stop()
-
-	body := make([]byte, 0, insertBatchBytes)
-	rows := 0
-
-	flush := func() {
-		if rows == 0 {
-			return
-		}
-
-		batches <- InsertBatch{
-			Body: body,
-			Rows: rows,
-		}
-
-		body = make([]byte, 0, insertBatchBytes)
-		rows = 0
+func sendInsertBatch(batch InsertBatch, batches chan InsertBatch) bool {
+	if batch.Rows == 0 {
+		return true
 	}
 
-	for {
+	if liveInsertOverloadPolicy != "raw_only" {
+		batches <- batch
+		return true
+	}
+
+	if channelUsagePct(batches) >= liveInsertQueueHighWatermarkPct {
+		return false
+	}
+
+	if liveInsertSendTimeoutMS <= 0 {
 		select {
-		case entry, ok := <-events:
-			if !ok {
-				flush()
-				return
-			}
-
-			beforeLen := len(body)
-			var err error
-			body, err = appendRowBinaryEvent(body, entry)
-			if err != nil {
-				body = body[:beforeLen]
-				atomic.AddUint64(&totalEventMarshalError, 1)
-				log.Printf("event_rowbinary_error event_id=%s error=%v", entry.EventID, err)
-				continue
-			}
-			rows++
-
-			if rows >= insertBatchRows || len(body) >= insertBatchBytes {
-				flush()
-			}
-
-		case <-flushTicker.C:
-			flush()
+		case batches <- batch:
+			return true
+		default:
+			return false
 		}
+	}
+
+	timer := time.NewTimer(time.Duration(liveInsertSendTimeoutMS) * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case batches <- batch:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -1095,7 +1130,6 @@ func metricsLogger(
 	stop <-chan struct{},
 	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
-	events <-chan NATLogEntry,
 	batches <-chan InsertBatch,
 ) {
 	var previousReceived uint64
@@ -1118,7 +1152,7 @@ func metricsLogger(
 			spoolLen, spoolCap := channelsLenCap(spoolQueues)
 
 			log.Printf(
-				"metrics total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_event=%d/%d queue_batch=%d/%d workers_raw=%d workers_packet=%d workers_batch=%d workers_insert=%d",
+				"metrics live_batch_mode=packet_worker_direct total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_batch=%d/%d workers_raw=%d workers_packet=%d workers_batch=%d workers_insert=%d",
 				received,
 				processed,
 				rawSpooled,
@@ -1126,6 +1160,7 @@ func metricsLogger(
 				inserted,
 				atomic.LoadUint64(&totalPacketQueueDrops),
 				atomic.LoadUint64(&totalLiveInsertSkipped),
+				atomic.LoadUint64(&totalLiveSkippedRows),
 				atomic.LoadUint64(&totalParseErrors),
 				atomic.LoadUint64(&totalRawMarshalErrors),
 				atomic.LoadUint64(&totalEventMarshalError),
@@ -1141,8 +1176,6 @@ func metricsLogger(
 				spoolCap,
 				len(packetChannel),
 				cap(packetChannel),
-				len(events),
-				cap(events),
 				len(batches),
 				cap(batches),
 				atomic.LoadInt64(&currentRawWriters),
@@ -1166,11 +1199,9 @@ func autoTuneSupervisor(
 	stop <-chan struct{},
 	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
-	events <-chan NATLogEntry,
 	insertBatches <-chan InsertBatch,
 	spawnRawWriters func(int),
 	spawnPacketWorkers func(int),
-	spawnBatchBuilders func(int),
 	spawnInsertWorkers func(int),
 	wg *sync.WaitGroup,
 ) {
@@ -1188,7 +1219,6 @@ func autoTuneSupervisor(
 		case <-ticker.C:
 			rawUsage := channelsMaxUsagePct(spoolQueues)
 			packetUsage := channelUsagePct(packetChannel)
-			eventUsage := channelUsagePct(events)
 			batchUsage := channelUsagePct(insertBatches)
 
 			if rawUsage >= autoTuneHighWatermarkPct {
@@ -1205,31 +1235,17 @@ func autoTuneSupervisor(
 				}
 			}
 
-			if packetUsage >= autoTuneHighWatermarkPct && eventUsage < autoTuneCriticalWatermarkPct {
+			if packetUsage >= autoTuneHighWatermarkPct && batchUsage < autoTuneCriticalWatermarkPct {
 				current := int(atomic.LoadInt64(&currentPacketWorkers))
 				step := scaleStep(current, autoTuneMaxPacketWorkers, packetUsage >= autoTuneCriticalWatermarkPct)
 				if step > 0 {
 					spawnPacketWorkers(step)
 					log.Printf(
-						"auto_tune_scale component=packet_workers from=%d to=%d queue_packet_pct=%d queue_event_pct=%d",
+						"auto_tune_scale component=packet_workers from=%d to=%d queue_packet_pct=%d queue_batch_pct=%d",
 						current,
 						current+step,
 						packetUsage,
-						eventUsage,
-					)
-				}
-			}
-
-			if eventUsage >= autoTuneHighWatermarkPct {
-				current := int(atomic.LoadInt64(&currentBatchBuilders))
-				step := scaleStep(current, autoTuneMaxBatchBuilders, eventUsage >= autoTuneCriticalWatermarkPct)
-				if step > 0 {
-					spawnBatchBuilders(step)
-					log.Printf(
-						"auto_tune_scale component=batch_builders from=%d to=%d queue_event_pct=%d",
-						current,
-						current+step,
-						eventUsage,
+						batchUsage,
 					)
 				}
 			}
@@ -1347,9 +1363,7 @@ func validateConfig() {
 		"PACKET_CHANNEL_SIZE":          packetChannelSize,
 		"RAW_WRITERS":                  rawWriters,
 		"RAW_CHANNEL_SIZE":             rawChannelSize,
-		"EVENT_CHANNEL_SIZE":           eventChannelSize,
 		"INSERT_WORKERS":               insertWorkers,
-		"BATCH_BUILDERS":               batchBuilders,
 		"INSERT_BATCH_ROWS":            insertBatchRows,
 		"INSERT_BATCH_BYTES":           insertBatchBytes,
 		"INSERT_FLUSH_MS":              insertFlushMS,
@@ -1363,7 +1377,6 @@ func validateConfig() {
 		"AUTO_TUNE_INTERVAL_SECONDS":   autoTuneIntervalSeconds,
 		"AUTO_TUNE_MAX_RAW_WRITERS":    autoTuneMaxRawWriters,
 		"AUTO_TUNE_MAX_PACKET_WORKERS": autoTuneMaxPacketWorkers,
-		"AUTO_TUNE_MAX_BATCH_BUILDERS": autoTuneMaxBatchBuilders,
 		"AUTO_TUNE_MAX_INSERT_WORKERS": autoTuneMaxInsertWorkers,
 	}
 
@@ -1402,9 +1415,6 @@ func validateConfig() {
 	}
 	if autoTuneMaxPacketWorkers < packetWorkers {
 		log.Fatal("AUTO_TUNE_MAX_PACKET_WORKERS cannot be lower than PACKET_WORKERS")
-	}
-	if autoTuneMaxBatchBuilders < batchBuilders {
-		log.Fatal("AUTO_TUNE_MAX_BATCH_BUILDERS cannot be lower than BATCH_BUILDERS")
 	}
 	if autoTuneMaxInsertWorkers < insertWorkers {
 		log.Fatal("AUTO_TUNE_MAX_INSERT_WORKERS cannot be lower than INSERT_WORKERS")
@@ -1523,7 +1533,6 @@ func main() {
 
 	spoolQueues := makeSpoolQueues(udpReceivers, rawChannelSize)
 	packetChannel := make(chan UDPPacket, packetChannelSize)
-	events := make(chan NATLogEntry, eventChannelSize)
 	insertBatches := make(chan InsertBatch, insertBatchChanSize)
 	fatalErrors := make(chan error, 1)
 	stop := make(chan struct{})
@@ -1555,7 +1564,6 @@ func main() {
 	var readWG sync.WaitGroup
 	var rawWG sync.WaitGroup
 	var packetWG sync.WaitGroup
-	var batchWG sync.WaitGroup
 	var insertWG sync.WaitGroup
 	var autoTuneWG sync.WaitGroup
 	var nextRawQueue uint64
@@ -1572,16 +1580,9 @@ func main() {
 	spawnPacketWorkers := func(count int) {
 		for range count {
 			workerID := int(atomic.AddInt64(&currentPacketWorkers, 1))
-			packetWG.Add(1)
-			go packetWorker(workerID, packetChannel, events, &packetWG)
-		}
-	}
-
-	spawnBatchBuilders := func(count int) {
-		for range count {
 			atomic.AddInt64(&currentBatchBuilders, 1)
-			batchWG.Add(1)
-			go batchBuilder(events, insertBatches, &batchWG)
+			packetWG.Add(1)
+			go packetWorker(workerID, packetChannel, insertBatches, &packetWG)
 		}
 	}
 
@@ -1595,7 +1596,6 @@ func main() {
 
 	spawnRawWriters(rawWriters)
 	spawnPacketWorkers(packetWorkers)
-	spawnBatchBuilders(batchBuilders)
 	spawnInsertWorkers(insertWorkers)
 
 	for receiverIndex, receiver := range receivers {
@@ -1603,24 +1603,22 @@ func main() {
 		go udpReadLoop(receiverIndex+1, receiver, spoolQueues[receiverIndex], stop, &readWG)
 	}
 
-	go metricsLogger(stop, spoolQueues, packetChannel, events, insertBatches)
+	go metricsLogger(stop, spoolQueues, packetChannel, insertBatches)
 
 	autoTuneWG.Add(1)
 	go autoTuneSupervisor(
 		stop,
 		spoolQueues,
 		packetChannel,
-		events,
 		insertBatches,
 		spawnRawWriters,
 		spawnPacketWorkers,
-		spawnBatchBuilders,
 		spawnInsertWorkers,
 		&autoTuneWG,
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s clickhouse_insert_format=RowBinary raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d event_channel_size=%d batch_builders=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true direct_live_batching=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
@@ -1633,11 +1631,11 @@ func main() {
 		packetChannelSize,
 		rawWriters,
 		rawChannelSize,
-		eventChannelSize,
 		batchBuilders,
 		insertWorkers,
 		insertBatchRows,
 		insertBatchBytes,
+		insertFlushMS,
 		udpReadBufferMB,
 		autoTuneEnabled,
 		autoTuneMaxRawWriters,
@@ -1657,8 +1655,6 @@ func main() {
 	rawWG.Wait()
 	close(packetChannel)
 	packetWG.Wait()
-	close(events)
-	batchWG.Wait()
 	close(insertBatches)
 	insertWG.Wait()
 	log.Printf("collector_stopped")
