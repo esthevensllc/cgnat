@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -166,10 +167,12 @@ func (receiver *udpReceiver) recvmmsg(fd uintptr, results []UDPReadResult) (int,
 	for index := 0; index < count; index++ {
 		name := receiver.names[index]
 		port := uint16(name.Port[0])<<8 | uint16(name.Port[1])
+		ipNum := binary.BigEndian.Uint32(name.Addr[:])
 		results[index] = UDPReadResult{
-			Data:       receiver.buffers[index][:receiver.messages[index].Len],
-			RouterIP:   net.IPv4(name.Addr[0], name.Addr[1], name.Addr[2], name.Addr[3]).String(),
-			RouterPort: port,
+			Data:        receiver.buffers[index][:receiver.messages[index].Len],
+			RouterIP:    net.IPv4(name.Addr[0], name.Addr[1], name.Addr[2], name.Addr[3]).String(),
+			RouterIPNum: ipNum,
+			RouterPort:  port,
 		}
 	}
 

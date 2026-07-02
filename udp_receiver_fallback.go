@@ -49,9 +49,10 @@ func (receiver *udpReceiver) ReadBatch(results []UDPReadResult) (int, error) {
 	}
 
 	results[0] = UDPReadResult{
-		Data:       receiver.buffer[:bytesRead],
-		RouterIP:   remoteAddress.IP.String(),
-		RouterPort: uint16(remoteAddress.Port),
+		Data:        receiver.buffer[:bytesRead],
+		RouterIP:    remoteAddress.IP.String(),
+		RouterIPNum: ipv4StringToUInt32(remoteAddress.IP.String()),
+		RouterPort:  uint16(remoteAddress.Port),
 	}
 	return 1, nil
 }

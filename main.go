@@ -47,37 +47,39 @@ type RawPacketLog struct {
 }
 
 type NATLogEntry struct {
-	EventTime       string `json:"event_time"`
-	StartTime       string `json:"start_time"`
-	EndTime         string `json:"end_time"`
-	EventID         string `json:"event_id"`
-	EventType       string `json:"event_type"`
-	Header          string `json:"header"`
-	RouterIP        string `json:"router_ip"`
-	RouterPort      uint16 `json:"router_port"`
-	ProtocolID      uint8  `json:"protocol_id"`
-	Protocol        string `json:"protocol"`
-	PrivateIP       string `json:"private_ip"`
-	PrivatePort     uint16 `json:"private_port"`
-	PublicIP        string `json:"public_ip"`
-	PublicPort      uint16 `json:"public_port"`
-	DestinationIP   string `json:"destination_ip"`
-	DestinationPort uint16 `json:"destination_port"`
-	PacketSize      uint16 `json:"packet_size"`
+	EventTime       uint32
+	StartTime       uint32
+	EndTime         uint32
+	EventID         string
+	EventType       string
+	Header          string
+	RouterIP        uint32
+	RouterPort      uint16
+	ProtocolID      uint8
+	Protocol        string
+	PrivateIP       uint32
+	PrivatePort     uint16
+	PublicIP        uint32
+	PublicPort      uint16
+	DestinationIP   uint32
+	DestinationPort uint16
+	PacketSize      uint16
 }
 
 type UDPPacket struct {
 	Buffer           []byte
 	Length           int
 	RouterIP         string
+	RouterIPNum      uint32
 	RouterPort       uint16
 	ReceivedUnixNano int64
 }
 
 type UDPReadResult struct {
-	Data       []byte
-	RouterIP   string
-	RouterPort uint16
+	Data        []byte
+	RouterIP    string
+	RouterIPNum uint32
+	RouterPort  uint16
 }
 
 type InsertBatch struct {
@@ -290,6 +292,54 @@ func protocolName(protocolID uint8) string {
 	}
 }
 
+func ipv4BytesToUInt32(data []byte) uint32 {
+	return binary.BigEndian.Uint32(data)
+}
+
+func ipv4StringToUInt32(value string) uint32 {
+	ip := net.ParseIP(value).To4()
+	if ip == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip)
+}
+
+func appendUInt8(buffer []byte, value uint8) []byte {
+	return append(buffer, value)
+}
+
+func appendUInt16(buffer []byte, value uint16) []byte {
+	var raw [2]byte
+	binary.LittleEndian.PutUint16(raw[:], value)
+	return append(buffer, raw[:]...)
+}
+
+func appendUInt32(buffer []byte, value uint32) []byte {
+	var raw [4]byte
+	binary.LittleEndian.PutUint32(raw[:], value)
+	return append(buffer, raw[:]...)
+}
+
+func appendULEB128(buffer []byte, value uint64) []byte {
+	for value >= 0x80 {
+		buffer = append(buffer, byte(value)|0x80)
+		value >>= 7
+	}
+	return append(buffer, byte(value))
+}
+
+func appendRowBinaryString(buffer []byte, value string) []byte {
+	buffer = appendULEB128(buffer, uint64(len(value)))
+	return append(buffer, value...)
+}
+
+func appendRowBinaryFixedString(buffer []byte, value string, size int) ([]byte, error) {
+	if len(value) != size {
+		return buffer, fmt.Errorf("fixed_string_size_mismatch size=%d actual=%d value=%q", size, len(value), value)
+	}
+	return append(buffer, value...), nil
+}
+
 func peruTimeFromUnix(timestamp uint32) string {
 	return time.Unix(int64(timestamp), 0).
 		In(peruTZ).
@@ -316,31 +366,29 @@ func timestampWithFallback(primary uint32, packetTimestamp uint32, receivedUnixN
 }
 
 func makeEventID(entry NATLogEntry) string {
-	value := fmt.Sprintf(
-		"%s|%s|%s|%s|%d|%s|%d|%s|%d|%s|%d|%s|%d",
-		entry.EventTime,
-		entry.StartTime,
-		entry.EndTime,
-		entry.RouterIP,
-		entry.ProtocolID,
-		entry.PrivateIP,
-		entry.PrivatePort,
-		entry.PublicIP,
-		entry.PublicPort,
-		entry.DestinationIP,
-		entry.DestinationPort,
-		entry.Header,
-		entry.PacketSize,
-	)
+	buffer := make([]byte, 0, 64)
+	buffer = appendUInt32(buffer, entry.EventTime)
+	buffer = appendUInt32(buffer, entry.StartTime)
+	buffer = appendUInt32(buffer, entry.EndTime)
+	buffer = appendUInt32(buffer, entry.RouterIP)
+	buffer = appendUInt8(buffer, entry.ProtocolID)
+	buffer = appendUInt32(buffer, entry.PrivateIP)
+	buffer = appendUInt16(buffer, entry.PrivatePort)
+	buffer = appendUInt32(buffer, entry.PublicIP)
+	buffer = appendUInt16(buffer, entry.PublicPort)
+	buffer = appendUInt32(buffer, entry.DestinationIP)
+	buffer = appendUInt16(buffer, entry.DestinationPort)
+	buffer = append(buffer, entry.Header...)
+	buffer = appendUInt16(buffer, entry.PacketSize)
 
-	sum := sha1.Sum([]byte(value))
+	sum := sha1.Sum(buffer)
 	return hex.EncodeToString(sum[:])
 }
 
 func parseMultiRecordPacket(
 	data []byte,
 	header string,
-	routerIP string,
+	routerIP uint32,
 	routerPort uint16,
 	receivedUnixNano int64,
 ) ([]NATLogEntry, error) {
@@ -379,9 +427,9 @@ func parseMultiRecordPacket(
 
 		record := data[recordStart:recordEnd]
 
-		privateIP := net.IP(record[4:8]).String()
-		publicIP := net.IP(record[8:12]).String()
-		destinationIP := net.IP(record[12:16]).String()
+		privateIP := ipv4BytesToUInt32(record[4:8])
+		publicIP := ipv4BytesToUInt32(record[8:12])
+		destinationIP := ipv4BytesToUInt32(record[12:16])
 
 		privatePort := binary.BigEndian.Uint16(record[20:22])
 		publicPort := binary.BigEndian.Uint16(record[22:24])
@@ -398,17 +446,14 @@ func parseMultiRecordPacket(
 			receivedUnixNano,
 		)
 
-		startTime := peruTimeFromUnix(startTimestamp)
-		endTime := peruTimeFromUnix(endTimestamp)
-
 		// El offset exacto del protocolo dentro del bloque de 64 bytes aún no
 		// está formalmente confirmado; se conserva 0/UNKNOWN para no inventarlo.
 		protocolID := uint8(0)
 
 		entry := NATLogEntry{
-			EventTime:       endTime,
-			StartTime:       startTime,
-			EndTime:         endTime,
+			EventTime:       endTimestamp,
+			StartTime:       startTimestamp,
+			EndTime:         endTimestamp,
 			EventType:       "huawei_cgn_nat",
 			Header:          header,
 			RouterIP:        routerIP,
@@ -434,7 +479,7 @@ func parseMultiRecordPacket(
 func parseLegacyPacket(
 	data []byte,
 	header string,
-	routerIP string,
+	routerIP uint32,
 	routerPort uint16,
 	receivedUnixNano int64,
 ) ([]NATLogEntry, error) {
@@ -447,25 +492,24 @@ func parseLegacyPacket(
 		0,
 		receivedUnixNano,
 	)
-	eventTime := peruTimeFromUnix(eventTimestamp)
 
 	protocolID := data[11]
 
 	entry := NATLogEntry{
-		EventTime:       eventTime,
-		StartTime:       eventTime,
-		EndTime:         eventTime,
+		EventTime:       eventTimestamp,
+		StartTime:       eventTimestamp,
+		EndTime:         eventTimestamp,
 		EventType:       "huawei_cgn_nat",
 		Header:          header,
 		RouterIP:        routerIP,
 		RouterPort:      routerPort,
 		ProtocolID:      protocolID,
 		Protocol:        protocolName(protocolID),
-		PrivateIP:       net.IP(data[20:24]).String(),
+		PrivateIP:       ipv4BytesToUInt32(data[20:24]),
 		PrivatePort:     binary.BigEndian.Uint16(data[36:38]),
-		PublicIP:        net.IP(data[24:28]).String(),
+		PublicIP:        ipv4BytesToUInt32(data[24:28]),
 		PublicPort:      binary.BigEndian.Uint16(data[38:40]),
-		DestinationIP:   net.IP(data[28:32]).String(),
+		DestinationIP:   ipv4BytesToUInt32(data[28:32]),
 		DestinationPort: binary.BigEndian.Uint16(data[40:42]),
 		PacketSize:      uint16(len(data)),
 	}
@@ -476,7 +520,7 @@ func parseLegacyPacket(
 
 func parsePacket(
 	data []byte,
-	routerIP string,
+	routerIP uint32,
 	routerPort uint16,
 	receivedUnixNano int64,
 ) ([]NATLogEntry, error) {
@@ -831,7 +875,7 @@ func rawSpoolWriter(
 func packetWorker(
 	workerID int,
 	packets <-chan UDPPacket,
-	eventLines chan<- []byte,
+	events chan<- NATLogEntry,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
@@ -841,7 +885,7 @@ func packetWorker(
 
 		entries, err := parsePacket(
 			data,
-			packet.RouterIP,
+			packet.RouterIPNum,
 			packet.RouterPort,
 			packet.ReceivedUnixNano,
 		)
@@ -856,20 +900,7 @@ func packetWorker(
 			)
 		} else {
 			for _, entry := range entries {
-				entryJSON, err := json.Marshal(entry)
-				if err != nil {
-					atomic.AddUint64(&totalEventMarshalError, 1)
-					log.Printf(
-						"event_marshal_error worker=%d event_id=%s error=%v",
-						workerID,
-						entry.EventID,
-						err,
-					)
-					continue
-				}
-
-				entryJSON = append(entryJSON, '\n')
-				eventLines <- entryJSON
+				events <- entry
 				atomic.AddUint64(&totalParsed, 1)
 			}
 		}
@@ -879,7 +910,34 @@ func packetWorker(
 	}
 }
 
-func batchBuilder(eventLines <-chan []byte, batches chan<- InsertBatch, wg *sync.WaitGroup) {
+func appendRowBinaryEvent(buffer []byte, entry NATLogEntry) ([]byte, error) {
+	buffer = appendUInt32(buffer, entry.EventTime)
+	buffer = appendUInt32(buffer, entry.StartTime)
+	buffer = appendUInt32(buffer, entry.EndTime)
+
+	var err error
+	buffer, err = appendRowBinaryFixedString(buffer, entry.EventID, 40)
+	if err != nil {
+		return buffer, err
+	}
+
+	buffer = appendRowBinaryString(buffer, entry.EventType)
+	buffer = appendRowBinaryString(buffer, entry.Header)
+	buffer = appendUInt32(buffer, entry.RouterIP)
+	buffer = appendUInt16(buffer, entry.RouterPort)
+	buffer = appendUInt8(buffer, entry.ProtocolID)
+	buffer = appendRowBinaryString(buffer, entry.Protocol)
+	buffer = appendUInt32(buffer, entry.PrivateIP)
+	buffer = appendUInt16(buffer, entry.PrivatePort)
+	buffer = appendUInt32(buffer, entry.PublicIP)
+	buffer = appendUInt16(buffer, entry.PublicPort)
+	buffer = appendUInt32(buffer, entry.DestinationIP)
+	buffer = appendUInt16(buffer, entry.DestinationPort)
+	buffer = appendUInt16(buffer, entry.PacketSize)
+	return buffer, nil
+}
+
+func batchBuilder(events <-chan NATLogEntry, batches chan<- InsertBatch, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	flushTicker := time.NewTicker(time.Duration(insertFlushMS) * time.Millisecond)
@@ -904,18 +962,21 @@ func batchBuilder(eventLines <-chan []byte, batches chan<- InsertBatch, wg *sync
 
 	for {
 		select {
-		case line, ok := <-eventLines:
+		case entry, ok := <-events:
 			if !ok {
 				flush()
 				return
 			}
 
-			if rows > 0 &&
-				(rows >= insertBatchRows || len(body)+len(line) > insertBatchBytes) {
-				flush()
+			beforeLen := len(body)
+			var err error
+			body, err = appendRowBinaryEvent(body, entry)
+			if err != nil {
+				body = body[:beforeLen]
+				atomic.AddUint64(&totalEventMarshalError, 1)
+				log.Printf("event_rowbinary_error event_id=%s error=%v", entry.EventID, err)
+				continue
 			}
-
-			body = append(body, line...)
 			rows++
 
 			if rows >= insertBatchRows || len(body) >= insertBatchBytes {
@@ -959,7 +1020,7 @@ func insertBatchToClickHouse(client *http.Client, batch InsertBatch) error {
 		return err
 	}
 
-	request.Header.Set("Content-Type", "application/x-ndjson")
+	request.Header.Set("Content-Type", "application/octet-stream")
 	request.Header.Set("Connection", "keep-alive")
 
 	if clickhouseUser != "" {
@@ -1034,7 +1095,7 @@ func metricsLogger(
 	stop <-chan struct{},
 	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
-	eventLines <-chan []byte,
+	events <-chan NATLogEntry,
 	batches <-chan InsertBatch,
 ) {
 	var previousReceived uint64
@@ -1080,8 +1141,8 @@ func metricsLogger(
 				spoolCap,
 				len(packetChannel),
 				cap(packetChannel),
-				len(eventLines),
-				cap(eventLines),
+				len(events),
+				cap(events),
 				len(batches),
 				cap(batches),
 				atomic.LoadInt64(&currentRawWriters),
@@ -1105,7 +1166,7 @@ func autoTuneSupervisor(
 	stop <-chan struct{},
 	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
-	eventLines <-chan []byte,
+	events <-chan NATLogEntry,
 	insertBatches <-chan InsertBatch,
 	spawnRawWriters func(int),
 	spawnPacketWorkers func(int),
@@ -1127,7 +1188,7 @@ func autoTuneSupervisor(
 		case <-ticker.C:
 			rawUsage := channelsMaxUsagePct(spoolQueues)
 			packetUsage := channelUsagePct(packetChannel)
-			eventUsage := channelUsagePct(eventLines)
+			eventUsage := channelUsagePct(events)
 			batchUsage := channelUsagePct(insertBatches)
 
 			if rawUsage >= autoTuneHighWatermarkPct {
@@ -1271,7 +1332,7 @@ func loadConfig() {
 	liveInsertQueueHighWatermarkPct = getEnvInt("LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT", 95)
 	liveInsertSendTimeoutMS = getEnvInt("LIVE_INSERT_SEND_TIMEOUT_MS", 1)
 
-	query := fmt.Sprintf("INSERT INTO %s FORMAT JSONEachRow", clickhouseTable)
+	query := fmt.Sprintf("INSERT INTO %s FORMAT RowBinary", clickhouseTable)
 	insertURL = strings.TrimRight(clickhouseURL, "/") + "/?query=" + url.QueryEscape(query)
 }
 
@@ -1418,6 +1479,7 @@ func udpReadLoop(
 				Buffer:           packetBuffer,
 				Length:           bytesRead,
 				RouterIP:         result.RouterIP,
+				RouterIPNum:      result.RouterIPNum,
 				RouterPort:       result.RouterPort,
 				ReceivedUnixNano: receivedAt,
 			}
@@ -1461,7 +1523,7 @@ func main() {
 
 	spoolQueues := makeSpoolQueues(udpReceivers, rawChannelSize)
 	packetChannel := make(chan UDPPacket, packetChannelSize)
-	eventLines := make(chan []byte, eventChannelSize)
+	events := make(chan NATLogEntry, eventChannelSize)
 	insertBatches := make(chan InsertBatch, insertBatchChanSize)
 	fatalErrors := make(chan error, 1)
 	stop := make(chan struct{})
@@ -1511,7 +1573,7 @@ func main() {
 		for range count {
 			workerID := int(atomic.AddInt64(&currentPacketWorkers, 1))
 			packetWG.Add(1)
-			go packetWorker(workerID, packetChannel, eventLines, &packetWG)
+			go packetWorker(workerID, packetChannel, events, &packetWG)
 		}
 	}
 
@@ -1519,7 +1581,7 @@ func main() {
 		for range count {
 			atomic.AddInt64(&currentBatchBuilders, 1)
 			batchWG.Add(1)
-			go batchBuilder(eventLines, insertBatches, &batchWG)
+			go batchBuilder(events, insertBatches, &batchWG)
 		}
 	}
 
@@ -1541,14 +1603,14 @@ func main() {
 		go udpReadLoop(receiverIndex+1, receiver, spoolQueues[receiverIndex], stop, &readWG)
 	}
 
-	go metricsLogger(stop, spoolQueues, packetChannel, eventLines, insertBatches)
+	go metricsLogger(stop, spoolQueues, packetChannel, events, insertBatches)
 
 	autoTuneWG.Add(1)
 	go autoTuneSupervisor(
 		stop,
 		spoolQueues,
 		packetChannel,
-		eventLines,
+		events,
 		insertBatches,
 		spawnRawWriters,
 		spawnPacketWorkers,
@@ -1558,7 +1620,7 @@ func main() {
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d event_channel_size=%d batch_builders=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s clickhouse_insert_format=RowBinary raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d event_channel_size=%d batch_builders=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
@@ -1595,7 +1657,7 @@ func main() {
 	rawWG.Wait()
 	close(packetChannel)
 	packetWG.Wait()
-	close(eventLines)
+	close(events)
 	batchWG.Wait()
 	close(insertBatches)
 	insertWG.Wait()
