@@ -83,8 +83,9 @@ type UDPReadResult struct {
 }
 
 type InsertBatch struct {
-	Body []byte
-	Rows int
+	TableName string
+	Body      []byte
+	Rows      int
 }
 
 var (
@@ -93,7 +94,7 @@ var (
 	clickhouseUser  string
 	clickhousePass  string
 	clickhouseTable string
-	insertURL       string
+	hourlyTables    bool
 
 	rawSpoolBase string
 	rawFormat    string
@@ -150,11 +151,18 @@ var (
 	totalInsertDroppedRows uint64
 	totalLiveSkippedRows   uint64
 	totalBatchesInserted   uint64
+	totalTablesCreated     uint64
+	totalTableCreateErrors uint64
 
 	currentRawWriters    int64
 	currentPacketWorkers int64
 	currentBatchBuilders int64
 	currentInsertWorkers int64
+)
+
+var (
+	createdTablesMu sync.Mutex
+	createdTables   = make(map[string]struct{})
 )
 
 var packetBuffer512Pool = sync.Pool{
@@ -339,6 +347,92 @@ func appendRowBinaryFixedString(buffer []byte, value string, size int) ([]byte, 
 		return buffer, fmt.Errorf("fixed_string_size_mismatch size=%d actual=%d value=%q", size, len(value), value)
 	}
 	return append(buffer, value...), nil
+}
+
+func isValidClickHouseIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for index, char := range value {
+		isLetter := (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z')
+		isDigit := char >= '0' && char <= '9'
+		if index == 0 {
+			if !isLetter && char != '_' {
+				return false
+			}
+			continue
+		}
+
+		if !isLetter && !isDigit && char != '_' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validateClickHouseTableName(tableName string) error {
+	parts := strings.Split(tableName, ".")
+	if len(parts) == 0 || len(parts) > 2 {
+		return fmt.Errorf("invalid_clickhouse_table_name table=%s", tableName)
+	}
+
+	for _, part := range parts {
+		if !isValidClickHouseIdentifier(part) {
+			return fmt.Errorf("invalid_clickhouse_identifier part=%s table=%s", part, tableName)
+		}
+	}
+
+	return nil
+}
+
+func hourlyTableName(baseTable string, eventUnix uint32) string {
+	if !hourlyTables {
+		return baseTable
+	}
+
+	suffix := time.Unix(int64(eventUnix), 0).In(peruTZ).Format("2006_01_02_15")
+	parts := strings.Split(baseTable, ".")
+	if len(parts) == 2 {
+		return parts[0] + "." + parts[1] + "_" + suffix
+	}
+	return baseTable + "_" + suffix
+}
+
+func clickHouseInsertURL(tableName string) string {
+	query := fmt.Sprintf(
+		"INSERT INTO %s (event_time, start_time, end_time, event_id, event_type, header, router_ip, router_port, protocol_id, protocol, private_ip, private_port, public_ip, public_port, destination_ip, destination_port, packet_size) FORMAT RowBinary",
+		tableName,
+	)
+	return strings.TrimRight(clickhouseURL, "/") + "/?query=" + url.QueryEscape(query)
+}
+
+func clickHouseCreateTableDDL(tableName string) string {
+	return fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s
+(
+    event_time DateTime,
+    start_time DateTime,
+    end_time DateTime,
+    event_id FixedString(40),
+    event_type String,
+    header String,
+    router_ip IPv4,
+    router_port UInt16,
+    protocol_id UInt8,
+    protocol String,
+    private_ip IPv4,
+    private_port UInt16,
+    public_ip IPv4,
+    public_port UInt16,
+    destination_ip IPv4,
+    destination_port UInt16,
+    packet_size UInt16
+)
+ENGINE = MergeTree
+ORDER BY (event_time, router_ip, private_ip, public_ip, destination_ip, private_port, public_port)
+SETTINGS index_granularity = 8192`, tableName)
 }
 
 func peruTimeFromUnix(timestamp uint32) string {
@@ -889,30 +983,44 @@ func packetWorker(
 		initialBatchCapacity = 1024 * 1024
 	}
 
-	body := make([]byte, 0, initialBatchCapacity)
-	rows := 0
+	type pendingBatch struct {
+		body []byte
+		rows int
+	}
 
-	flush := func() {
-		if rows == 0 {
+	pending := make(map[string]*pendingBatch, 2)
+
+	newPendingBatch := func() *pendingBatch {
+		return &pendingBatch{
+			body: make([]byte, 0, initialBatchCapacity),
+		}
+	}
+
+	flushTable := func(tableName string, batch *pendingBatch) {
+		if batch == nil || batch.rows == 0 {
 			return
 		}
 
-		if sendInsertBatch(InsertBatch{Body: body, Rows: rows}, batches) {
-			body = make([]byte, 0, initialBatchCapacity)
-			rows = 0
+		if sendInsertBatch(InsertBatch{TableName: tableName, Body: batch.body, Rows: batch.rows}, batches) {
+			pending[tableName] = newPendingBatch()
 			return
 		}
 
-		atomic.AddUint64(&totalLiveSkippedRows, uint64(rows))
-		body = make([]byte, 0, initialBatchCapacity)
-		rows = 0
+		atomic.AddUint64(&totalLiveSkippedRows, uint64(batch.rows))
+		pending[tableName] = newPendingBatch()
+	}
+
+	flushAll := func() {
+		for tableName, batch := range pending {
+			flushTable(tableName, batch)
+		}
 	}
 
 	for {
 		select {
 		case packet, ok := <-packets:
 			if !ok {
-				flush()
+				flushAll()
 				return
 			}
 
@@ -935,21 +1043,28 @@ func packetWorker(
 				)
 			} else {
 				for _, entry := range entries {
-					beforeLen := len(body)
+					tableName := hourlyTableName(clickhouseTable, entry.EventTime)
+					batch := pending[tableName]
+					if batch == nil {
+						batch = newPendingBatch()
+						pending[tableName] = batch
+					}
+
+					beforeLen := len(batch.body)
 					var err error
-					body, err = appendRowBinaryEvent(body, entry)
+					batch.body, err = appendRowBinaryEvent(batch.body, entry)
 					if err != nil {
-						body = body[:beforeLen]
+						batch.body = batch.body[:beforeLen]
 						atomic.AddUint64(&totalEventMarshalError, 1)
 						log.Printf("event_rowbinary_error worker=%d event_id=%s error=%v", workerID, entry.EventID, err)
 						continue
 					}
 
-					rows++
+					batch.rows++
 					atomic.AddUint64(&totalParsed, 1)
 
-					if rows >= insertBatchRows || len(body) >= insertBatchBytes {
-						flush()
+					if batch.rows >= insertBatchRows || len(batch.body) >= insertBatchBytes {
+						flushTable(tableName, batch)
 					}
 				}
 			}
@@ -958,7 +1073,7 @@ func packetWorker(
 			releasePacketBuffer(packet.Buffer)
 
 		case <-flushTicker.C:
-			flush()
+			flushAll()
 		}
 	}
 }
@@ -1045,10 +1160,68 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-func insertBatchToClickHouse(client *http.Client, batch InsertBatch) error {
+func executeClickHouseQuery(client *http.Client, query string) error {
 	request, err := http.NewRequest(
 		http.MethodPost,
-		insertURL,
+		strings.TrimRight(clickhouseURL, "/")+"/?query="+url.QueryEscape(query),
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	request.Header.Set("Connection", "keep-alive")
+
+	if clickhouseUser != "" {
+		request.SetBasicAuth(clickhouseUser, clickhousePass)
+	}
+
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+		return fmt.Errorf(
+			"clickhouse_status=%d body=%s",
+			response.StatusCode,
+			strings.TrimSpace(string(responseBody)),
+		)
+	}
+
+	_, _ = io.Copy(io.Discard, response.Body)
+	return nil
+}
+
+func ensureClickHouseTable(client *http.Client, tableName string) error {
+	createdTablesMu.Lock()
+	if _, ok := createdTables[tableName]; ok {
+		createdTablesMu.Unlock()
+		return nil
+	}
+	defer createdTablesMu.Unlock()
+
+	if err := executeClickHouseQuery(client, clickHouseCreateTableDDL(tableName)); err != nil {
+		atomic.AddUint64(&totalTableCreateErrors, 1)
+		return err
+	}
+
+	createdTables[tableName] = struct{}{}
+	atomic.AddUint64(&totalTablesCreated, 1)
+	log.Printf("clickhouse_table_ready table=%s", tableName)
+	return nil
+}
+
+func insertBatchToClickHouse(client *http.Client, batch InsertBatch) error {
+	if err := ensureClickHouseTable(client, batch.TableName); err != nil {
+		return fmt.Errorf("clickhouse_create_table table=%s error=%w", batch.TableName, err)
+	}
+
+	request, err := http.NewRequest(
+		http.MethodPost,
+		clickHouseInsertURL(batch.TableName),
 		bytes.NewReader(batch.Body),
 	)
 	if err != nil {
@@ -1098,8 +1271,9 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 			}
 
 			log.Printf(
-				"clickhouse_insert_retry worker=%d attempt=%d/%d rows=%d bytes=%d error=%v",
+				"clickhouse_insert_retry worker=%d table=%s attempt=%d/%d rows=%d bytes=%d error=%v",
 				workerID,
+				batch.TableName,
 				attempt,
 				insertMaxRetries,
 				batch.Rows,
@@ -1116,8 +1290,9 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 			atomic.AddUint64(&totalInsertErrors, 1)
 			atomic.AddUint64(&totalInsertDroppedRows, uint64(batch.Rows))
 			log.Printf(
-				"clickhouse_insert_failed worker=%d rows=%d bytes=%d error=%v raw_reprocess_required=true",
+				"clickhouse_insert_failed worker=%d table=%s rows=%d bytes=%d error=%v raw_reprocess_required=true",
 				workerID,
+				batch.TableName,
 				batch.Rows,
 				len(batch.Body),
 				lastErr,
@@ -1152,7 +1327,7 @@ func metricsLogger(
 			spoolLen, spoolCap := channelsLenCap(spoolQueues)
 
 			log.Printf(
-				"metrics live_batch_mode=packet_worker_direct total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_batch=%d/%d workers_raw=%d workers_packet=%d workers_batch=%d workers_insert=%d",
+				"metrics live_batch_mode=packet_worker_direct total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_tables_created=%d total_table_create_errors=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_batch=%d/%d workers_raw=%d workers_packet=%d workers_batch=%d workers_insert=%d",
 				received,
 				processed,
 				rawSpooled,
@@ -1167,6 +1342,8 @@ func metricsLogger(
 				atomic.LoadUint64(&totalInsertErrors),
 				atomic.LoadUint64(&totalInsertDroppedRows),
 				atomic.LoadUint64(&totalBatchesInserted),
+				atomic.LoadUint64(&totalTablesCreated),
+				atomic.LoadUint64(&totalTableCreateErrors),
 				received-previousReceived,
 				processed-previousPacketProcessed,
 				rawSpooled-previousRawSpooled,
@@ -1277,6 +1454,7 @@ func loadConfig() {
 	clickhouseUser = getEnv("CLICKHOUSE_USER", "admin")
 	clickhousePass = getEnv("CLICKHOUSE_PASS", "")
 	clickhouseTable = getEnv("CLICKHOUSE_TABLE", "cgnat.huawei_cgn_nat_v2")
+	hourlyTables = getEnvBool("CLICKHOUSE_HOURLY_TABLES", true)
 
 	rawSpoolBase = getEnv("RAW_SPOOL_BASE", "/index2/huawei-cgn-go/raw")
 	rawFormat = strings.ToLower(getEnv("RAW_SPOOL_FORMAT", rawFormatBinary))
@@ -1347,9 +1525,6 @@ func loadConfig() {
 	liveInsertOverloadPolicy = strings.ToLower(getEnv("LIVE_INSERT_OVERLOAD_POLICY", "raw_only"))
 	liveInsertQueueHighWatermarkPct = getEnvInt("LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT", 95)
 	liveInsertSendTimeoutMS = getEnvInt("LIVE_INSERT_SEND_TIMEOUT_MS", 1)
-
-	query := fmt.Sprintf("INSERT INTO %s FORMAT RowBinary", clickhouseTable)
-	insertURL = strings.TrimRight(clickhouseURL, "/") + "/?query=" + url.QueryEscape(query)
 }
 
 func validateConfig() {
@@ -1392,6 +1567,10 @@ func validateConfig() {
 
 	if syncEveryPackets < 0 {
 		log.Fatal("SYNC_EVERY_EVENTS cannot be negative")
+	}
+
+	if err := validateClickHouseTableName(clickhouseTable); err != nil {
+		log.Fatal(err)
 	}
 
 	switch rawFormat {
@@ -1618,9 +1797,11 @@ func main() {
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table=%s clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true direct_live_batching=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_hourly_tables=%t clickhouse_hourly_pattern=%s_YYYY_MM_DD_HH24 clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true direct_live_batching=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
+		clickhouseTable,
+		hourlyTables,
 		clickhouseTable,
 		rawSpoolBase,
 		rawFormat,

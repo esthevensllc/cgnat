@@ -21,6 +21,16 @@ cp huawei-cgn-go.example huawei-cgn-go
 Completar la URL, el usuario y la contrasena de ClickHouse. El archivo
 `huawei-cgn-go` contiene credenciales y esta excluido de Git.
 
+`CLICKHOUSE_TABLE` es el nombre base. Con `CLICKHOUSE_HOURLY_TABLES=true` el
+collector inserta en tablas por hora con el formato:
+
+```text
+cgnat.huawei_cgn_nat_v2_YYYY_MM_DD_HH24
+```
+
+Antes del primer insert de cada hora ejecuta `CREATE TABLE IF NOT EXISTS` con
+el esquema RowBinary esperado por el collector.
+
 ## Compilacion
 
 ```bash
@@ -33,6 +43,7 @@ Al arrancar, el log debe mostrar:
 ```text
 clickhouse_insert_format=RowBinary
 live_batch_mode=packet_worker_direct
+clickhouse_hourly_tables=true
 ```
 
 En esta version `BATCH_BUILDERS` y `EVENT_CHANNEL_SIZE` quedan aceptados por
