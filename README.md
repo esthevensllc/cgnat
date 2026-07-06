@@ -21,15 +21,19 @@ cp huawei-cgn-go.example huawei-cgn-go
 Completar la URL, el usuario y la contrasena de ClickHouse. El archivo
 `huawei-cgn-go` contiene credenciales y esta excluido de Git.
 
-`CLICKHOUSE_TABLE` es el nombre base. Con `CLICKHOUSE_HOURLY_TABLES=true` el
-collector inserta en tablas por hora con el formato:
+`CLICKHOUSE_TABLE` es el nombre base. Con `CLICKHOUSE_DAILY_TABLES=true` el
+collector inserta en tablas por dia con el formato:
 
 ```text
-cgnat.huawei_cgn_nat_v2_YYYY_MM_DD_HH24
+cgnat.huawei_cgn_nat_v2_YYYY_MM_DD
 ```
 
-Antes del primer insert de cada hora ejecuta `CREATE TABLE IF NOT EXISTS` con
+Antes del primer insert de cada dia ejecuta `CREATE TABLE IF NOT EXISTS` con
 el esquema RowBinary esperado por el collector.
+
+El collector ya no guarda RAW/binarios de todos los paquetes. Solo escribe
+archivos RowBinary en `FAILED_SPOOL_BASE` cuando un lote no pudo insertarse en
+ClickHouse despues de todos los reintentos.
 
 ## Compilacion
 
@@ -43,15 +47,14 @@ Al arrancar, el log debe mostrar:
 ```text
 clickhouse_insert_format=RowBinary
 live_batch_mode=packet_worker_direct
-clickhouse_hourly_tables=true
+clickhouse_daily_tables=true
+raw_spool_mode=failed_inserts_only
 ```
 
 En esta version `BATCH_BUILDERS` y `EVENT_CHANNEL_SIZE` quedan aceptados por
 compatibilidad, pero ya no controlan el camino caliente. Para validar carga,
-mirar principalmente `queue_packet`, `queue_batch`, `total_live_insert_skipped`
-y `total_live_insert_skipped_rows`. Si ClickHouse no alcanza, el modo
-`LIVE_INSERT_OVERLOAD_POLICY=raw_only` conserva el RAW binario y salta la ruta
-live sin frenar la recepcion UDP.
+mirar principalmente `queue_packet`, `queue_batch`, `total_failed_batch_spooled`
+y `total_failed_spool_errors`.
 
 ## Simulador UDP
 

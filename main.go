@@ -88,16 +88,26 @@ type InsertBatch struct {
 	Rows      int
 }
 
+type FailedInsertBatchMeta struct {
+	CreatedTime string `json:"created_time"`
+	TableName   string `json:"table_name"`
+	Rows        int    `json:"rows"`
+	Bytes       int    `json:"bytes"`
+	Format      string `json:"format"`
+	Error       string `json:"error"`
+}
+
 var (
 	listenAddr      string
 	clickhouseURL   string
 	clickhouseUser  string
 	clickhousePass  string
 	clickhouseTable string
-	hourlyTables    bool
+	dailyTables     bool
 
-	rawSpoolBase string
-	rawFormat    string
+	rawSpoolBase    string
+	failedSpoolBase string
+	rawFormat       string
 
 	maxPacketsPerFile   int
 	minPacketsPerFile   int
@@ -137,22 +147,25 @@ var (
 	liveInsertQueueHighWatermarkPct int
 	liveInsertSendTimeoutMS         int
 
-	totalReceived          uint64
-	totalPacketProcessed   uint64
-	totalPacketQueueDrops  uint64
-	totalLiveInsertSkipped uint64
-	totalRawSpooled        uint64
-	totalParsed            uint64
-	totalInserted          uint64
-	totalParseErrors       uint64
-	totalRawMarshalErrors  uint64
-	totalEventMarshalError uint64
-	totalInsertErrors      uint64
-	totalInsertDroppedRows uint64
-	totalLiveSkippedRows   uint64
-	totalBatchesInserted   uint64
-	totalTablesCreated     uint64
-	totalTableCreateErrors uint64
+	totalReceived           uint64
+	totalPacketProcessed    uint64
+	totalPacketQueueDrops   uint64
+	totalLiveInsertSkipped  uint64
+	totalRawSpooled         uint64
+	totalParsed             uint64
+	totalInserted           uint64
+	totalParseErrors        uint64
+	totalRawMarshalErrors   uint64
+	totalEventMarshalError  uint64
+	totalInsertErrors       uint64
+	totalInsertDroppedRows  uint64
+	totalLiveSkippedRows    uint64
+	totalBatchesInserted    uint64
+	totalFailedBatchSpooled uint64
+	totalFailedRowsSpooled  uint64
+	totalFailedSpoolErrors  uint64
+	totalTablesCreated      uint64
+	totalTableCreateErrors  uint64
 
 	currentRawWriters    int64
 	currentPacketWorkers int64
@@ -387,12 +400,12 @@ func validateClickHouseTableName(tableName string) error {
 	return nil
 }
 
-func hourlyTableName(baseTable string, eventUnix uint32) string {
-	if !hourlyTables {
+func dailyTableName(baseTable string, eventUnix uint32) string {
+	if !dailyTables {
 		return baseTable
 	}
 
-	suffix := time.Unix(int64(eventUnix), 0).In(peruTZ).Format("2006_01_02_15")
+	suffix := time.Unix(int64(eventUnix), 0).In(peruTZ).Format("2006_01_02")
 	parts := strings.Split(baseTable, ".")
 	if len(parts) == 2 {
 		return parts[0] + "." + parts[1] + "_" + suffix
@@ -756,6 +769,88 @@ func reportFatal(fatalErrors chan<- error, err error) {
 	}
 }
 
+func ensureFailedSpoolDirs(base string) error {
+	for _, dir := range []string{"open", "done"} {
+		if err := os.MkdirAll(filepath.Join(base, dir), 0750); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func safeFileToken(value string) string {
+	replacer := strings.NewReplacer(".", "_", "/", "_", "\\", "_", ":", "_", " ", "_")
+	return replacer.Replace(value)
+}
+
+func spoolFailedInsertBatch(batch InsertBatch, insertErr error) error {
+	if batch.Rows == 0 || len(batch.Body) == 0 {
+		return nil
+	}
+
+	now := time.Now().In(peruTZ)
+	token := safeFileToken(batch.TableName)
+	baseName := fmt.Sprintf(
+		"failed_%s_%s_%d_rows%d.rowbinary",
+		token,
+		now.Format("20060102_150405"),
+		time.Now().UnixNano(),
+		batch.Rows,
+	)
+
+	openPath := filepath.Join(failedSpoolBase, "open", baseName+".open")
+	donePath := filepath.Join(failedSpoolBase, "done", baseName+".done")
+	metaPath := donePath + ".json"
+
+	file, err := os.OpenFile(openPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	if err != nil {
+		return err
+	}
+
+	if _, err := file.Write(batch.Body); err != nil {
+		_ = file.Close()
+		_ = os.Remove(openPath)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(openPath)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(openPath)
+		return err
+	}
+
+	if err := os.Rename(openPath, donePath); err != nil {
+		_ = os.Remove(openPath)
+		return err
+	}
+
+	meta := FailedInsertBatchMeta{
+		CreatedTime: now.Format("2006-01-02 15:04:05"),
+		TableName:   batch.TableName,
+		Rows:        batch.Rows,
+		Bytes:       len(batch.Body),
+		Format:      "RowBinary",
+		Error:       insertErr.Error(),
+	}
+
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	metaJSON = append(metaJSON, '\n')
+	if err := os.WriteFile(metaPath, metaJSON, 0640); err != nil {
+		return err
+	}
+
+	atomic.AddUint64(&totalFailedBatchSpooled, 1)
+	atomic.AddUint64(&totalFailedRowsSpooled, uint64(batch.Rows))
+	log.Printf("failed_insert_spooled table=%s rows=%d bytes=%d file=%s", batch.TableName, batch.Rows, len(batch.Body), donePath)
+	return nil
+}
+
 func writeRawJSONLPacket(writer *bufio.Writer, packet UDPPacket) error {
 	data := packet.Buffer[:packet.Length]
 	rawPacket := RawPacketLog{
@@ -1001,12 +1096,27 @@ func packetWorker(
 			return
 		}
 
-		if sendInsertBatch(InsertBatch{TableName: tableName, Body: batch.body, Rows: batch.rows}, batches) {
+		insertBatch := InsertBatch{TableName: tableName, Body: batch.body, Rows: batch.rows}
+		if sendInsertBatch(insertBatch, batches) {
 			pending[tableName] = newPendingBatch()
 			return
 		}
 
 		atomic.AddUint64(&totalLiveSkippedRows, uint64(batch.rows))
+		atomic.AddUint64(&totalLiveInsertSkipped, 1)
+		overloadErr := fmt.Errorf("live_insert_queue_overload queue_batch=%d/%d", len(batches), cap(batches))
+		if err := spoolFailedInsertBatch(insertBatch, overloadErr); err != nil {
+			atomic.AddUint64(&totalFailedSpoolErrors, 1)
+			log.Printf(
+				"failed_insert_spool_error worker=%d table=%s rows=%d bytes=%d error=%v original_insert_error=%v",
+				workerID,
+				tableName,
+				batch.rows,
+				len(batch.body),
+				err,
+				overloadErr,
+			)
+		}
 		pending[tableName] = newPendingBatch()
 	}
 
@@ -1043,7 +1153,7 @@ func packetWorker(
 				)
 			} else {
 				for _, entry := range entries {
-					tableName := hourlyTableName(clickhouseTable, entry.EventTime)
+					tableName := dailyTableName(clickhouseTable, entry.EventTime)
 					batch := pending[tableName]
 					if batch == nil {
 						batch = newPendingBatch()
@@ -1289,8 +1399,20 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 		if lastErr != nil {
 			atomic.AddUint64(&totalInsertErrors, 1)
 			atomic.AddUint64(&totalInsertDroppedRows, uint64(batch.Rows))
+			if err := spoolFailedInsertBatch(batch, lastErr); err != nil {
+				atomic.AddUint64(&totalFailedSpoolErrors, 1)
+				log.Printf(
+					"failed_insert_spool_error worker=%d table=%s rows=%d bytes=%d error=%v original_insert_error=%v",
+					workerID,
+					batch.TableName,
+					batch.Rows,
+					len(batch.Body),
+					err,
+					lastErr,
+				)
+			}
 			log.Printf(
-				"clickhouse_insert_failed worker=%d table=%s rows=%d bytes=%d error=%v raw_reprocess_required=true",
+				"clickhouse_insert_failed worker=%d table=%s rows=%d bytes=%d error=%v failed_batch_reprocess_required=true",
 				workerID,
 				batch.TableName,
 				batch.Rows,
@@ -1303,13 +1425,11 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 
 func metricsLogger(
 	stop <-chan struct{},
-	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
 	batches <-chan InsertBatch,
 ) {
 	var previousReceived uint64
 	var previousPacketProcessed uint64
-	var previousRawSpooled uint64
 	var previousParsed uint64
 	var previousInserted uint64
 
@@ -1321,41 +1441,36 @@ func metricsLogger(
 		case <-ticker.C:
 			received := atomic.LoadUint64(&totalReceived)
 			processed := atomic.LoadUint64(&totalPacketProcessed)
-			rawSpooled := atomic.LoadUint64(&totalRawSpooled)
 			parsed := atomic.LoadUint64(&totalParsed)
 			inserted := atomic.LoadUint64(&totalInserted)
-			spoolLen, spoolCap := channelsLenCap(spoolQueues)
 
 			log.Printf(
-				"metrics live_batch_mode=packet_worker_direct total_received=%d total_packet_processed=%d total_raw_spooled=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_raw_marshal_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_tables_created=%d total_table_create_errors=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_raw_spooled_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_raw_input=%d/%d queue_packet=%d/%d queue_batch=%d/%d workers_raw=%d workers_packet=%d workers_batch=%d workers_insert=%d",
+				"metrics live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only total_received=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d",
 				received,
 				processed,
-				rawSpooled,
 				parsed,
 				inserted,
 				atomic.LoadUint64(&totalPacketQueueDrops),
 				atomic.LoadUint64(&totalLiveInsertSkipped),
 				atomic.LoadUint64(&totalLiveSkippedRows),
 				atomic.LoadUint64(&totalParseErrors),
-				atomic.LoadUint64(&totalRawMarshalErrors),
 				atomic.LoadUint64(&totalEventMarshalError),
 				atomic.LoadUint64(&totalInsertErrors),
 				atomic.LoadUint64(&totalInsertDroppedRows),
 				atomic.LoadUint64(&totalBatchesInserted),
+				atomic.LoadUint64(&totalFailedBatchSpooled),
+				atomic.LoadUint64(&totalFailedRowsSpooled),
+				atomic.LoadUint64(&totalFailedSpoolErrors),
 				atomic.LoadUint64(&totalTablesCreated),
 				atomic.LoadUint64(&totalTableCreateErrors),
 				received-previousReceived,
 				processed-previousPacketProcessed,
-				rawSpooled-previousRawSpooled,
 				parsed-previousParsed,
 				inserted-previousInserted,
-				spoolLen,
-				spoolCap,
 				len(packetChannel),
 				cap(packetChannel),
 				len(batches),
 				cap(batches),
-				atomic.LoadInt64(&currentRawWriters),
 				atomic.LoadInt64(&currentPacketWorkers),
 				atomic.LoadInt64(&currentBatchBuilders),
 				atomic.LoadInt64(&currentInsertWorkers),
@@ -1363,7 +1478,6 @@ func metricsLogger(
 
 			previousReceived = received
 			previousPacketProcessed = processed
-			previousRawSpooled = rawSpooled
 			previousParsed = parsed
 			previousInserted = inserted
 		case <-stop:
@@ -1374,10 +1488,8 @@ func metricsLogger(
 
 func autoTuneSupervisor(
 	stop <-chan struct{},
-	spoolQueues []chan UDPPacket,
 	packetChannel <-chan UDPPacket,
 	insertBatches <-chan InsertBatch,
-	spawnRawWriters func(int),
 	spawnPacketWorkers func(int),
 	spawnInsertWorkers func(int),
 	wg *sync.WaitGroup,
@@ -1394,23 +1506,8 @@ func autoTuneSupervisor(
 	for {
 		select {
 		case <-ticker.C:
-			rawUsage := channelsMaxUsagePct(spoolQueues)
 			packetUsage := channelUsagePct(packetChannel)
 			batchUsage := channelUsagePct(insertBatches)
-
-			if rawUsage >= autoTuneHighWatermarkPct {
-				current := int(atomic.LoadInt64(&currentRawWriters))
-				step := scaleStep(current, autoTuneMaxRawWriters, rawUsage >= autoTuneCriticalWatermarkPct)
-				if step > 0 {
-					spawnRawWriters(step)
-					log.Printf(
-						"auto_tune_scale component=raw_writers from=%d to=%d queue_raw_input_pct=%d",
-						current,
-						current+step,
-						rawUsage,
-					)
-				}
-			}
 
 			if packetUsage >= autoTuneHighWatermarkPct && batchUsage < autoTuneCriticalWatermarkPct {
 				current := int(atomic.LoadInt64(&currentPacketWorkers))
@@ -1454,9 +1551,10 @@ func loadConfig() {
 	clickhouseUser = getEnv("CLICKHOUSE_USER", "admin")
 	clickhousePass = getEnv("CLICKHOUSE_PASS", "")
 	clickhouseTable = getEnv("CLICKHOUSE_TABLE", "cgnat.huawei_cgn_nat_v2")
-	hourlyTables = getEnvBool("CLICKHOUSE_HOURLY_TABLES", true)
+	dailyTables = getEnvBool("CLICKHOUSE_DAILY_TABLES", true)
 
 	rawSpoolBase = getEnv("RAW_SPOOL_BASE", "/index2/huawei-cgn-go/raw")
+	failedSpoolBase = getEnv("FAILED_SPOOL_BASE", filepath.Join(rawSpoolBase, "failed"))
 	rawFormat = strings.ToLower(getEnv("RAW_SPOOL_FORMAT", rawFormatBinary))
 
 	maxPacketsPerFile = getEnvInt("MAX_EVENTS_PER_FILE", 250000)
@@ -1687,10 +1785,9 @@ func main() {
 	loadConfig()
 	validateConfig()
 
-	if err := ensureRawSpoolDirs(rawSpoolBase); err != nil {
-		log.Fatalf("raw_spool_directory_error error=%v", err)
+	if err := ensureFailedSpoolDirs(failedSpoolBase); err != nil {
+		log.Fatalf("failed_spool_directory_error error=%v", err)
 	}
-	recoverRawSpool()
 
 	readBufferBytes := udpReadBufferMB * 1024 * 1024
 	receivers := make([]*udpReceiver, 0, udpReceivers)
@@ -1710,7 +1807,6 @@ func main() {
 	}
 	defer closeUDPReceivers(receivers)
 
-	spoolQueues := makeSpoolQueues(udpReceivers, rawChannelSize)
 	packetChannel := make(chan UDPPacket, packetChannelSize)
 	insertBatches := make(chan InsertBatch, insertBatchChanSize)
 	fatalErrors := make(chan error, 1)
@@ -1741,20 +1837,9 @@ func main() {
 	}()
 
 	var readWG sync.WaitGroup
-	var rawWG sync.WaitGroup
 	var packetWG sync.WaitGroup
 	var insertWG sync.WaitGroup
 	var autoTuneWG sync.WaitGroup
-	var nextRawQueue uint64
-
-	spawnRawWriters := func(count int) {
-		for range count {
-			writerID := int(atomic.AddInt64(&currentRawWriters, 1))
-			queueIndex := int(atomic.AddUint64(&nextRawQueue, 1)-1) % len(spoolQueues)
-			rawWG.Add(1)
-			go rawSpoolWriter(writerID, spoolQueues[queueIndex], packetChannel, fatalErrors, &rawWG)
-		}
-	}
 
 	spawnPacketWorkers := func(count int) {
 		for range count {
@@ -1773,45 +1858,39 @@ func main() {
 		}
 	}
 
-	spawnRawWriters(rawWriters)
 	spawnPacketWorkers(packetWorkers)
 	spawnInsertWorkers(insertWorkers)
 
 	for receiverIndex, receiver := range receivers {
 		readWG.Add(1)
-		go udpReadLoop(receiverIndex+1, receiver, spoolQueues[receiverIndex], stop, &readWG)
+		go udpReadLoop(receiverIndex+1, receiver, packetChannel, stop, &readWG)
 	}
 
-	go metricsLogger(stop, spoolQueues, packetChannel, insertBatches)
+	go metricsLogger(stop, packetChannel, insertBatches)
 
 	autoTuneWG.Add(1)
 	go autoTuneSupervisor(
 		stop,
-		spoolQueues,
 		packetChannel,
 		insertBatches,
-		spawnRawWriters,
 		spawnPacketWorkers,
 		spawnInsertWorkers,
 		&autoTuneWG,
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_hourly_tables=%t clickhouse_hourly_pattern=%s_YYYY_MM_DD_HH24 clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool=%s raw_format=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d raw_writers=%d raw_channel_size_per_receiver=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_raw_writers=%d auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=true direct_live_batching=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
-		hourlyTables,
+		dailyTables,
 		clickhouseTable,
-		rawSpoolBase,
-		rawFormat,
+		failedSpoolBase,
 		udpReceivers,
 		udpReusePort,
 		udpBatchSize,
 		packetWorkers,
 		packetChannelSize,
-		rawWriters,
-		rawChannelSize,
 		batchBuilders,
 		insertWorkers,
 		insertBatchRows,
@@ -1819,7 +1898,6 @@ func main() {
 		insertFlushMS,
 		udpReadBufferMB,
 		autoTuneEnabled,
-		autoTuneMaxRawWriters,
 		autoTuneMaxPacketWorkers,
 		autoTuneMaxBatchBuilders,
 		autoTuneMaxInsertWorkers,
@@ -1830,10 +1908,6 @@ func main() {
 	readWG.Wait()
 	log.Printf("collector_draining_start")
 	autoTuneWG.Wait()
-	for _, queue := range spoolQueues {
-		close(queue)
-	}
-	rawWG.Wait()
 	close(packetChannel)
 	packetWG.Wait()
 	close(insertBatches)
