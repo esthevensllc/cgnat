@@ -3,9 +3,10 @@
 Collector UDP escrito en Go para recibir eventos Huawei CGN NAT, conservar
 paquetes RAW e insertar los eventos procesados en ClickHouse.
 
-El flujo de alto trafico en Linux usa varios sockets UDP con `SO_REUSEPORT`,
-recepcion por lotes con `recvmmsg`, colas RAW separadas por receptor, RAW
-binario configurable y workers adaptativos para parseo e insercion. La
+El flujo de alto trafico en Linux puede usar un socket UDP compartido
+(`UDP_RECEIVE_MODE=shared_socket`) con varios readers `recvmmsg`, o el modo
+compatible con varios sockets `SO_REUSEPORT` (`UDP_RECEIVE_MODE=reuseport`).
+La recepcion por lotes usa `recvmmsg` y workers adaptativos para parseo e insercion. La
 insercion live hacia ClickHouse usa `RowBinary` por HTTP y los `PACKET_WORKERS`
 arman los batches directamente, sin una cola central de eventos, para evitar
 que `queue_event` sea el cuello de botella.
@@ -49,6 +50,7 @@ clickhouse_insert_format=RowBinary
 live_batch_mode=packet_worker_direct
 clickhouse_daily_tables=true
 raw_spool_mode=failed_inserts_only
+udp_receive_mode=shared_socket
 ```
 
 En esta version `BATCH_BUILDERS` y `EVENT_CHANNEL_SIZE` quedan aceptados por

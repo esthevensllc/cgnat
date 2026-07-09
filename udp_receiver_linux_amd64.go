@@ -33,17 +33,44 @@ type mmsghdr struct {
 type udpReceiver struct {
 	conn     *net.UDPConn
 	raw      syscall.RawConn
+	ownsConn bool
 	buffers  [][]byte
 	names    []rawSockaddrInet4
 	iovecs   []syscall.Iovec
 	messages []mmsghdr
 }
 
-func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, batchSize int) (*udpReceiver, error) {
+func newUDPReceiver(conn *net.UDPConn, rawConn syscall.RawConn, batchSize int, ownsConn bool) *udpReceiver {
 	if batchSize < 1 {
 		batchSize = 1
 	}
 
+	receiver := &udpReceiver{
+		conn:     conn,
+		raw:      rawConn,
+		ownsConn: ownsConn,
+		buffers:  make([][]byte, batchSize),
+		names:    make([]rawSockaddrInet4, batchSize),
+		iovecs:   make([]syscall.Iovec, batchSize),
+		messages: make([]mmsghdr, batchSize),
+	}
+
+	for index := 0; index < batchSize; index++ {
+		receiver.buffers[index] = make([]byte, maxUDPPacketSize)
+		receiver.iovecs[index] = syscall.Iovec{
+			Base: &receiver.buffers[index][0],
+			Len:  uint64(len(receiver.buffers[index])),
+		}
+		receiver.messages[index].Hdr.Name = (*byte)(unsafe.Pointer(&receiver.names[index]))
+		receiver.messages[index].Hdr.Namelen = uint32(unsafe.Sizeof(receiver.names[index]))
+		receiver.messages[index].Hdr.Iov = &receiver.iovecs[index]
+		receiver.messages[index].Hdr.Iovlen = 1
+	}
+
+	return receiver
+}
+
+func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, batchSize int) (*udpReceiver, error) {
 	listenConfig := net.ListenConfig{
 		Control: func(network string, address string, raw syscall.RawConn) error {
 			var controlErr error
@@ -85,31 +112,17 @@ func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, 
 		return nil, err
 	}
 
-	receiver := &udpReceiver{
-		conn:     conn,
-		raw:      rawConn,
-		buffers:  make([][]byte, batchSize),
-		names:    make([]rawSockaddrInet4, batchSize),
-		iovecs:   make([]syscall.Iovec, batchSize),
-		messages: make([]mmsghdr, batchSize),
-	}
+	return newUDPReceiver(conn, rawConn, batchSize, true), nil
+}
 
-	for index := 0; index < batchSize; index++ {
-		receiver.buffers[index] = make([]byte, maxUDPPacketSize)
-		receiver.iovecs[index] = syscall.Iovec{
-			Base: &receiver.buffers[index][0],
-			Len:  uint64(len(receiver.buffers[index])),
-		}
-		receiver.messages[index].Hdr.Name = (*byte)(unsafe.Pointer(&receiver.names[index]))
-		receiver.messages[index].Hdr.Namelen = uint32(unsafe.Sizeof(receiver.names[index]))
-		receiver.messages[index].Hdr.Iov = &receiver.iovecs[index]
-		receiver.messages[index].Hdr.Iovlen = 1
-	}
-
-	return receiver, nil
+func cloneUDPReceiver(receiver *udpReceiver, batchSize int) *udpReceiver {
+	return newUDPReceiver(receiver.conn, receiver.raw, batchSize, false)
 }
 
 func (receiver *udpReceiver) Close() error {
+	if !receiver.ownsConn {
+		return nil
+	}
 	return receiver.conn.Close()
 }
 

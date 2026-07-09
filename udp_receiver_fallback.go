@@ -9,8 +9,9 @@ import (
 )
 
 type udpReceiver struct {
-	conn   *net.UDPConn
-	buffer []byte
+	conn     *net.UDPConn
+	buffer   []byte
+	ownsConn bool
 }
 
 func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, batchSize int) (*udpReceiver, error) {
@@ -29,12 +30,24 @@ func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, 
 	}
 
 	return &udpReceiver{
-		conn:   conn,
-		buffer: make([]byte, maxUDPPacketSize),
+		conn:     conn,
+		buffer:   make([]byte, maxUDPPacketSize),
+		ownsConn: true,
 	}, nil
 }
 
+func cloneUDPReceiver(receiver *udpReceiver, batchSize int) *udpReceiver {
+	return &udpReceiver{
+		conn:     receiver.conn,
+		buffer:   make([]byte, maxUDPPacketSize),
+		ownsConn: false,
+	}
+}
+
 func (receiver *udpReceiver) Close() error {
+	if !receiver.ownsConn {
+		return nil
+	}
 	return receiver.conn.Close()
 }
 

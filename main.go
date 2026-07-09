@@ -32,6 +32,8 @@ const (
 	rawFormatBinary   = "binary"
 	rawFormatJSONL    = "jsonl"
 	rawBinaryMagic    = "HCGNRAW2\n"
+	udpModeReusePort  = "reuseport"
+	udpModeShared     = "shared_socket"
 )
 
 var peruTZ = time.FixedZone("PET", -5*60*60)
@@ -133,6 +135,7 @@ var (
 	udpReceivers        int
 	udpBatchSize        int
 	udpReusePort        bool
+	udpReceiveMode      string
 
 	autoTuneEnabled              bool
 	autoTuneIntervalSeconds      int
@@ -1589,6 +1592,10 @@ func loadConfig() {
 	udpReceivers = getEnvInt("UDP_RECEIVERS", 4)
 	udpBatchSize = getEnvInt("UDP_BATCH_SIZE", 64)
 	udpReusePort = getEnvBool("UDP_REUSEPORT", true)
+	udpReceiveMode = strings.ToLower(getEnv("UDP_RECEIVE_MODE", udpModeReusePort))
+	if udpReceiveMode == udpModeShared {
+		udpReusePort = false
+	}
 	if strings.TrimSpace(os.Getenv("RAW_WRITERS")) == "" && rawWriters < udpReceivers {
 		rawWriters = udpReceivers
 	}
@@ -1675,6 +1682,12 @@ func validateConfig() {
 	case rawFormatBinary, rawFormatJSONL:
 	default:
 		log.Fatal("RAW_SPOOL_FORMAT must be binary or jsonl")
+	}
+
+	switch udpReceiveMode {
+	case udpModeReusePort, udpModeShared:
+	default:
+		log.Fatal("UDP_RECEIVE_MODE must be reuseport or shared_socket")
 	}
 
 	if autoTuneHighWatermarkPct <= 0 || autoTuneHighWatermarkPct > 100 {
@@ -1791,19 +1804,37 @@ func main() {
 
 	readBufferBytes := udpReadBufferMB * 1024 * 1024
 	receivers := make([]*udpReceiver, 0, udpReceivers)
-	for receiverID := 1; receiverID <= udpReceivers; receiverID++ {
-		receiver, err := openUDPReceiver(listenAddr, udpReusePort, readBufferBytes, udpBatchSize)
+	switch udpReceiveMode {
+	case udpModeShared:
+		receiver, err := openUDPReceiver(listenAddr, false, readBufferBytes, udpBatchSize)
 		if err != nil {
-			closeUDPReceivers(receivers)
 			log.Fatalf(
-				"listen_udp_error receiver=%d address=%s reuse_port=%t error=%v",
-				receiverID,
+				"listen_udp_error receiver=1 address=%s receive_mode=%s reuse_port=false error=%v",
 				listenAddr,
-				udpReusePort,
+				udpReceiveMode,
 				err,
 			)
 		}
 		receivers = append(receivers, receiver)
+		for receiverID := 2; receiverID <= udpReceivers; receiverID++ {
+			receivers = append(receivers, cloneUDPReceiver(receiver, udpBatchSize))
+		}
+	default:
+		for receiverID := 1; receiverID <= udpReceivers; receiverID++ {
+			receiver, err := openUDPReceiver(listenAddr, udpReusePort, readBufferBytes, udpBatchSize)
+			if err != nil {
+				closeUDPReceivers(receivers)
+				log.Fatalf(
+					"listen_udp_error receiver=%d address=%s receive_mode=%s reuse_port=%t error=%v",
+					receiverID,
+					listenAddr,
+					udpReceiveMode,
+					udpReusePort,
+					err,
+				)
+			}
+			receivers = append(receivers, receiver)
+		}
 	}
 	defer closeUDPReceivers(receivers)
 
@@ -1879,13 +1910,14 @@ func main() {
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
 		dailyTables,
 		clickhouseTable,
 		failedSpoolBase,
+		udpReceiveMode,
 		udpReceivers,
 		udpReusePort,
 		udpBatchSize,
