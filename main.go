@@ -26,14 +26,15 @@ import (
 )
 
 const (
-	generalHeaderSize = 16
-	recordSize        = 64
-	maxUDPPacketSize  = 65535
-	rawFormatBinary   = "binary"
-	rawFormatJSONL    = "jsonl"
-	rawBinaryMagic    = "HCGNRAW2\n"
-	udpModeReusePort  = "reuseport"
-	udpModeShared     = "shared_socket"
+	generalHeaderSize   = 16
+	recordSize          = 64
+	maxUDPPacketSize    = 65535
+	rawFormatBinary     = "binary"
+	rawFormatJSONL      = "jsonl"
+	rawBinaryMagic      = "HCGNRAW2\n"
+	udpModeReusePort    = "reuseport"
+	udpModeReusePortBPF = "reuseport_bpf"
+	udpModeShared       = "shared_socket"
 )
 
 var peruTZ = time.FixedZone("PET", -5*60*60)
@@ -84,6 +85,13 @@ type UDPReadResult struct {
 	RouterPort  uint16
 }
 
+type UDPReceiverStats struct {
+	Batches     uint64
+	Packets     uint64
+	FullBatches uint64
+	Errors      uint64
+}
+
 type InsertBatch struct {
 	TableName string
 	Body      []byte
@@ -111,31 +119,33 @@ var (
 	failedSpoolBase string
 	rawFormat       string
 
-	maxPacketsPerFile   int
-	minPacketsPerFile   int
-	rotateSeconds       int
-	forceRotateSeconds  int
-	syncEveryPackets    int
-	rawWriterBufferMB   int
-	rawWriters          int
-	rawChannelSize      int
-	packetWorkers       int
-	packetChannelSize   int
-	eventChannelSize    int
-	insertWorkers       int
-	batchBuilders       int
-	insertBatchRows     int
-	insertBatchBytes    int
-	insertFlushMS       int
-	insertBatchChanSize int
-	insertMaxRetries    int
-	insertRetryMS       int
-	insertHTTPTimeoutS  int
-	udpReadBufferMB     int
-	udpReceivers        int
-	udpBatchSize        int
-	udpReusePort        bool
-	udpReceiveMode      string
+	maxPacketsPerFile            int
+	minPacketsPerFile            int
+	rotateSeconds                int
+	forceRotateSeconds           int
+	syncEveryPackets             int
+	rawWriterBufferMB            int
+	rawWriters                   int
+	rawChannelSize               int
+	packetWorkers                int
+	packetChannelSize            int
+	eventChannelSize             int
+	insertWorkers                int
+	batchBuilders                int
+	insertBatchRows              int
+	insertBatchBytes             int
+	insertFlushMS                int
+	insertBatchChanSize          int
+	insertMaxRetries             int
+	insertRetryMS                int
+	insertHTTPTimeoutS           int
+	udpReadBufferMB              int
+	udpReceivers                 int
+	udpBatchSize                 int
+	udpReusePort                 bool
+	udpReceiveMode               string
+	udpReusePortHashOffsetsValue string
+	udpReusePortHashOffsets      []int
 
 	autoTuneEnabled              bool
 	autoTuneIntervalSeconds      int
@@ -1430,11 +1440,16 @@ func metricsLogger(
 	stop <-chan struct{},
 	packetChannel <-chan UDPPacket,
 	batches <-chan InsertBatch,
+	receiverStats []UDPReceiverStats,
 ) {
 	var previousReceived uint64
 	var previousPacketProcessed uint64
 	var previousParsed uint64
 	var previousInserted uint64
+	previousReceiverPackets := make([]uint64, len(receiverStats))
+	previousReceiverBatches := make([]uint64, len(receiverStats))
+	previousReceiverFullBatches := make([]uint64, len(receiverStats))
+	previousReceiverErrors := make([]uint64, len(receiverStats))
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -1447,8 +1462,51 @@ func metricsLogger(
 			parsed := atomic.LoadUint64(&totalParsed)
 			inserted := atomic.LoadUint64(&totalInserted)
 
+			receiverDistribution := make([]string, len(receiverStats))
+			var receiverPacketsMin uint64
+			var receiverPacketsMax uint64
+			var receiverBatchesDelta uint64
+			var receiverPacketsDelta uint64
+			var receiverFullBatchesDelta uint64
+			var receiverErrorsDelta uint64
+			for index := range receiverStats {
+				packets := atomic.LoadUint64(&receiverStats[index].Packets)
+				readBatches := atomic.LoadUint64(&receiverStats[index].Batches)
+				fullBatches := atomic.LoadUint64(&receiverStats[index].FullBatches)
+				readErrors := atomic.LoadUint64(&receiverStats[index].Errors)
+
+				packetsDelta := packets - previousReceiverPackets[index]
+				batchesDelta := readBatches - previousReceiverBatches[index]
+				fullBatchesDelta := fullBatches - previousReceiverFullBatches[index]
+				errorsDelta := readErrors - previousReceiverErrors[index]
+
+				receiverDistribution[index] = strconv.Itoa(index+1) + ":" + strconv.FormatUint(packetsDelta, 10)
+				if index == 0 || packetsDelta < receiverPacketsMin {
+					receiverPacketsMin = packetsDelta
+				}
+				if packetsDelta > receiverPacketsMax {
+					receiverPacketsMax = packetsDelta
+				}
+				receiverPacketsDelta += packetsDelta
+				receiverBatchesDelta += batchesDelta
+				receiverFullBatchesDelta += fullBatchesDelta
+				receiverErrorsDelta += errorsDelta
+
+				previousReceiverPackets[index] = packets
+				previousReceiverBatches[index] = readBatches
+				previousReceiverFullBatches[index] = fullBatches
+				previousReceiverErrors[index] = readErrors
+			}
+
+			averageBatch := 0.0
+			fullBatchPct := 0.0
+			if receiverBatchesDelta > 0 {
+				averageBatch = float64(receiverPacketsDelta) / float64(receiverBatchesDelta)
+				fullBatchPct = float64(receiverFullBatchesDelta) * 100 / float64(receiverBatchesDelta)
+			}
+
 			log.Printf(
-				"metrics live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only total_received=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d",
+				"metrics live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only total_received=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d pps_received_10s=%d pps_packet_processed_10s=%d rps_parsed_10s=%d rps_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d udp_read_batches_10s=%d udp_average_batch_10s=%.2f udp_full_batch_pct_10s=%.2f udp_read_errors_10s=%d udp_receiver_min_10s=%d udp_receiver_max_10s=%d udp_receiver_packets_10s=%s",
 				received,
 				processed,
 				parsed,
@@ -1470,6 +1528,10 @@ func metricsLogger(
 				processed-previousPacketProcessed,
 				parsed-previousParsed,
 				inserted-previousInserted,
+				(received-previousReceived)/10,
+				(processed-previousPacketProcessed)/10,
+				(parsed-previousParsed)/10,
+				(inserted-previousInserted)/10,
 				len(packetChannel),
 				cap(packetChannel),
 				len(batches),
@@ -1477,6 +1539,13 @@ func metricsLogger(
 				atomic.LoadInt64(&currentPacketWorkers),
 				atomic.LoadInt64(&currentBatchBuilders),
 				atomic.LoadInt64(&currentInsertWorkers),
+				receiverBatchesDelta,
+				averageBatch,
+				fullBatchPct,
+				receiverErrorsDelta,
+				receiverPacketsMin,
+				receiverPacketsMax,
+				strings.Join(receiverDistribution, ","),
 			)
 
 			previousReceived = received
@@ -1592,9 +1661,12 @@ func loadConfig() {
 	udpReceivers = getEnvInt("UDP_RECEIVERS", 4)
 	udpBatchSize = getEnvInt("UDP_BATCH_SIZE", 64)
 	udpReusePort = getEnvBool("UDP_REUSEPORT", true)
-	udpReceiveMode = strings.ToLower(getEnv("UDP_RECEIVE_MODE", udpModeReusePort))
+	udpReceiveMode = strings.ToLower(getEnv("UDP_RECEIVE_MODE", udpModeReusePortBPF))
+	udpReusePortHashOffsetsValue = getEnv("UDP_REUSEPORT_HASH_OFFSETS", "20,36")
 	if udpReceiveMode == udpModeShared {
 		udpReusePort = false
+	} else if udpReceiveMode == udpModeReusePortBPF {
+		udpReusePort = true
 	}
 	if strings.TrimSpace(os.Getenv("RAW_WRITERS")) == "" && rawWriters < udpReceivers {
 		rawWriters = udpReceivers
@@ -1685,9 +1757,18 @@ func validateConfig() {
 	}
 
 	switch udpReceiveMode {
-	case udpModeReusePort, udpModeShared:
+	case udpModeReusePort, udpModeReusePortBPF, udpModeShared:
 	default:
-		log.Fatal("UDP_RECEIVE_MODE must be reuseport or shared_socket")
+		log.Fatal("UDP_RECEIVE_MODE must be reuseport_bpf, reuseport, or shared_socket")
+	}
+
+	var err error
+	udpReusePortHashOffsets, err = parseReusePortHashOffsets(udpReusePortHashOffsetsValue)
+	if err != nil {
+		log.Fatalf("UDP_REUSEPORT_HASH_OFFSETS is invalid: %v", err)
+	}
+	if udpReceiveMode == udpModeReusePortBPF && udpReceivers < 2 {
+		log.Fatal("UDP_RECEIVERS must be at least 2 when UDP_RECEIVE_MODE=reuseport_bpf")
 	}
 
 	if autoTuneHighWatermarkPct <= 0 || autoTuneHighWatermarkPct > 100 {
@@ -1744,6 +1825,7 @@ func udpReadLoop(
 	receiver *udpReceiver,
 	spoolQueue chan<- UDPPacket,
 	stop <-chan struct{},
+	stats *UDPReceiverStats,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
@@ -1753,6 +1835,7 @@ func udpReadLoop(
 	for {
 		count, err := receiver.ReadBatch(results)
 		if err != nil {
+			atomic.AddUint64(&stats.Errors, 1)
 			select {
 			case <-stop:
 				return
@@ -1760,6 +1843,11 @@ func udpReadLoop(
 			}
 			log.Printf("udp_read_error receiver=%d error=%v", receiverID, err)
 			continue
+		}
+		atomic.AddUint64(&stats.Batches, 1)
+		atomic.AddUint64(&stats.Packets, uint64(count))
+		if count == len(results) {
+			atomic.AddUint64(&stats.FullBatches, 1)
 		}
 
 		receivedAt := time.Now().UnixNano()
@@ -1819,7 +1907,7 @@ func main() {
 		for receiverID := 2; receiverID <= udpReceivers; receiverID++ {
 			receivers = append(receivers, cloneUDPReceiver(receiver, udpBatchSize))
 		}
-	default:
+	case udpModeReusePort, udpModeReusePortBPF:
 		for receiverID := 1; receiverID <= udpReceivers; receiverID++ {
 			receiver, err := openUDPReceiver(listenAddr, udpReusePort, readBufferBytes, udpBatchSize)
 			if err != nil {
@@ -1835,8 +1923,25 @@ func main() {
 			}
 			receivers = append(receivers, receiver)
 		}
+		if udpReceiveMode == udpModeReusePortBPF {
+			if err := attachReusePortPayloadSelector(receivers[0], len(receivers), udpReusePortHashOffsets); err != nil {
+				closeUDPReceivers(receivers)
+				log.Fatalf(
+					"reuseport_bpf_setup_error sockets=%d hash_offsets=%s error=%v",
+					len(receivers),
+					formatReusePortHashOffsets(udpReusePortHashOffsets),
+					err,
+				)
+			}
+			log.Printf(
+				"reuseport_bpf_attached sockets=%d hash_offsets=%s selector=cbpf_payload_hash",
+				len(receivers),
+				formatReusePortHashOffsets(udpReusePortHashOffsets),
+			)
+		}
 	}
 	defer closeUDPReceivers(receivers)
+	receiverStats := make([]UDPReceiverStats, len(receivers))
 
 	packetChannel := make(chan UDPPacket, packetChannelSize)
 	insertBatches := make(chan InsertBatch, insertBatchChanSize)
@@ -1894,10 +1999,10 @@ func main() {
 
 	for receiverIndex, receiver := range receivers {
 		readWG.Add(1)
-		go udpReadLoop(receiverIndex+1, receiver, packetChannel, stop, &readWG)
+		go udpReadLoop(receiverIndex+1, receiver, packetChannel, stop, &receiverStats[receiverIndex], &readWG)
 	}
 
-	go metricsLogger(stop, packetChannel, insertBatches)
+	go metricsLogger(stop, packetChannel, insertBatches, receiverStats)
 
 	autoTuneWG.Add(1)
 	go autoTuneSupervisor(
@@ -1910,7 +2015,7 @@ func main() {
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_batch_size=%d packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_reuseport_hash_offsets=%s udp_batch_size=%d packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
@@ -1920,6 +2025,7 @@ func main() {
 		udpReceiveMode,
 		udpReceivers,
 		udpReusePort,
+		formatReusePortHashOffsets(udpReusePortHashOffsets),
 		udpBatchSize,
 		packetWorkers,
 		packetChannelSize,

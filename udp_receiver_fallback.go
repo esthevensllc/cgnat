@@ -44,6 +44,10 @@ func cloneUDPReceiver(receiver *udpReceiver, batchSize int) *udpReceiver {
 	}
 }
 
+func attachReusePortPayloadSelector(receiver *udpReceiver, socketCount int, hashOffsets []int) error {
+	return fmt.Errorf("reuseport_bpf is only supported on linux/amd64")
+}
+
 func (receiver *udpReceiver) Close() error {
 	if !receiver.ownsConn {
 		return nil

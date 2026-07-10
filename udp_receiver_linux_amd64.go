@@ -8,13 +8,24 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
 
 const (
-	sysRecvmmsg = 299
-	soReusePort = 15
+	sysRecvmmsg           = 299
+	soReusePort           = 15
+	soAttachReusePortCBPF = 51
+
+	bpfLoadWordAbsolute = 0x20
+	bpfStoreA           = 0x02
+	bpfLoadXMemory      = 0x61
+	bpfMultiplyK        = 0x24
+	bpfRightShiftK      = 0x74
+	bpfXorX             = 0xac
+	bpfModuloK          = 0x94
+	bpfReturnA          = 0x16
 )
 
 type rawSockaddrInet4 struct {
@@ -117,6 +128,79 @@ func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, 
 
 func cloneUDPReceiver(receiver *udpReceiver, batchSize int) *udpReceiver {
 	return newUDPReceiver(receiver.conn, receiver.raw, batchSize, false)
+}
+
+func buildReusePortCBPF(socketCount int, hashOffsets []int) ([]syscall.SockFilter, error) {
+	if socketCount <= 1 {
+		return nil, fmt.Errorf("reuseport_bpf requires at least two sockets")
+	}
+	if len(hashOffsets) == 0 {
+		return nil, fmt.Errorf("reuseport_bpf requires at least one payload hash offset")
+	}
+
+	// Reuseport CBPF sees byte zero as the first byte of the UDP payload.
+	filters := make([]syscall.SockFilter, 0, len(hashOffsets)*5+5)
+	for index, offset := range hashOffsets {
+		if offset < 0 || offset > maxUDPPacketSize-4 {
+			return nil, fmt.Errorf("reuseport_bpf payload offset %d is outside the UDP payload", offset)
+		}
+
+		filters = append(filters,
+			syscall.SockFilter{Code: bpfLoadWordAbsolute, K: uint32(offset)},
+			syscall.SockFilter{Code: bpfMultiplyK, K: reusePortHashPrimes[index%len(reusePortHashPrimes)]},
+		)
+		if index > 0 {
+			filters = append(filters,
+				syscall.SockFilter{Code: bpfLoadXMemory, K: 0},
+				syscall.SockFilter{Code: bpfXorX},
+			)
+		}
+		filters = append(filters, syscall.SockFilter{Code: bpfStoreA, K: 0})
+	}
+
+	filters = append(filters,
+		syscall.SockFilter{Code: bpfRightShiftK, K: 16},
+		syscall.SockFilter{Code: bpfLoadXMemory, K: 0},
+		syscall.SockFilter{Code: bpfXorX},
+		syscall.SockFilter{Code: bpfModuloK, K: uint32(socketCount)},
+		syscall.SockFilter{Code: bpfReturnA},
+	)
+	return filters, nil
+}
+
+func attachReusePortPayloadSelector(receiver *udpReceiver, socketCount int, hashOffsets []int) error {
+	filters, err := buildReusePortCBPF(socketCount, hashOffsets)
+	if err != nil {
+		return err
+	}
+
+	program := syscall.SockFprog{
+		Len:    uint16(len(filters)),
+		Filter: &filters[0],
+	}
+	var syscallErr error
+	if err := receiver.raw.Control(func(fd uintptr) {
+		_, _, errno := syscall.Syscall6(
+			syscall.SYS_SETSOCKOPT,
+			fd,
+			uintptr(syscall.SOL_SOCKET),
+			uintptr(soAttachReusePortCBPF),
+			uintptr(unsafe.Pointer(&program)),
+			unsafe.Sizeof(program),
+			0,
+		)
+		if errno != 0 {
+			syscallErr = errno
+		}
+	}); err != nil {
+		return fmt.Errorf("reuseport_bpf_control_error: %w", err)
+	}
+	runtime.KeepAlive(filters)
+	runtime.KeepAlive(program)
+	if syscallErr != nil {
+		return fmt.Errorf("reuseport_bpf_attach_error: %w", syscallErr)
+	}
+	return nil
 }
 
 func (receiver *udpReceiver) Close() error {

@@ -1,11 +1,15 @@
 # Huawei CGN NAT Collector
 
-Collector UDP escrito en Go para recibir eventos Huawei CGN NAT, conservar
-paquetes RAW e insertar los eventos procesados en ClickHouse.
+Collector UDP escrito en Go para recibir eventos Huawei CGN NAT, insertar los
+eventos procesados en ClickHouse y preservar en disco los lotes que no pudieron
+insertarse.
 
-El flujo de alto trafico en Linux puede usar un socket UDP compartido
-(`UDP_RECEIVE_MODE=shared_socket`) con varios readers `recvmmsg`, o el modo
-compatible con varios sockets `SO_REUSEPORT` (`UDP_RECEIVE_MODE=reuseport`).
+El flujo de alto trafico en Linux usa varios sockets independientes
+`SO_REUSEPORT` y un selector BPF por contenido
+(`UDP_RECEIVE_MODE=reuseport_bpf`). El selector evita que todos los paquetes
+de un router pesado queden fijados al mismo socket. Los modos `reuseport` con
+hash normal del kernel y `shared_socket` se mantienen para diagnostico y
+reversion.
 La recepcion por lotes usa `recvmmsg` y workers adaptativos para parseo e insercion. La
 insercion live hacia ClickHouse usa `RowBinary` por HTTP y los `PACKET_WORKERS`
 arman los batches directamente, sin una cola central de eventos, para evitar
@@ -50,13 +54,31 @@ clickhouse_insert_format=RowBinary
 live_batch_mode=packet_worker_direct
 clickhouse_daily_tables=true
 raw_spool_mode=failed_inserts_only
-udp_receive_mode=shared_socket
+udp_receive_mode=reuseport_bpf
+udp_reuse_port=true
+udp_reuseport_hash_offsets=20,36
 ```
+
+Tambien debe existir una linea anterior que confirme que el filtro se adjunto:
+
+```text
+reuseport_bpf_attached sockets=16 hash_offsets=20,36 selector=cbpf_payload_hash
+```
+
+`UDP_REUSEPORT_HASH_OFFSETS` se mide desde el primer byte del payload UDP. Los
+offsets `20,36` mezclan campos variables del primer registro Huawei y no
+dependen de los cuatro bytes del header. El modo requiere Linux 4.5 o superior;
+si el kernel rechaza el filtro, el collector termina durante el arranque para
+no ejecutar una prueba con balanceo aparente.
 
 En esta version `BATCH_BUILDERS` y `EVENT_CHANNEL_SIZE` quedan aceptados por
 compatibilidad, pero ya no controlan el camino caliente. Para validar carga,
 mirar principalmente `queue_packet`, `queue_batch`, `total_failed_batch_spooled`
-y `total_failed_spool_errors`.
+y `total_failed_spool_errors`. Las metricas `udp_receiver_packets_10s`,
+`udp_receiver_min_10s` y `udp_receiver_max_10s` permiten comprobar que todos
+los sockets reciben trafico. `pps_received_10s` ya expresa paquetes por segundo;
+el campo historico `rate_received_10s` conserva el total de los ultimos diez
+segundos por compatibilidad.
 
 ## Simulador UDP
 

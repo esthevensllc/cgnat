@@ -22,7 +22,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/index2/huawei-cgn-go/raw
+ReadWritePaths=/index2/huawei-cgn-go/failed
 
 StandardOutput=journal
 StandardError=journal
