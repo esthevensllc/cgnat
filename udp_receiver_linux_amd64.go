@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -17,6 +18,7 @@ const (
 	sysRecvmmsg           = 299
 	soReusePort           = 15
 	soAttachReusePortCBPF = 51
+	soRXQOverflow         = 40
 
 	bpfLoadWordAbsolute = 0x20
 	bpfStoreA           = 0x02
@@ -41,33 +43,52 @@ type mmsghdr struct {
 	Pad [4]byte
 }
 
-type udpReceiver struct {
-	conn     *net.UDPConn
-	raw      syscall.RawConn
-	ownsConn bool
-	buffers  [][]byte
-	names    []rawSockaddrInet4
-	iovecs   []syscall.Iovec
-	messages []mmsghdr
+type udpSocketDropTracker struct {
+	state uint64
 }
 
-func newUDPReceiver(conn *net.UDPConn, rawConn syscall.RawConn, batchSize int, ownsConn bool) *udpReceiver {
+type udpReceiver struct {
+	conn        *net.UDPConn
+	raw         syscall.RawConn
+	ownsConn    bool
+	buffers     [][]byte
+	controls    [][]byte
+	names       []rawSockaddrInet4
+	iovecs      []syscall.Iovec
+	messages    []mmsghdr
+	dropTracker *udpSocketDropTracker
+}
+
+func newUDPReceiver(
+	conn *net.UDPConn,
+	rawConn syscall.RawConn,
+	batchSize int,
+	ownsConn bool,
+	dropTracker *udpSocketDropTracker,
+) *udpReceiver {
 	if batchSize < 1 {
 		batchSize = 1
 	}
+	if dropTracker == nil {
+		dropTracker = &udpSocketDropTracker{}
+	}
+	controlSize := syscall.CmsgSpace(4)
 
 	receiver := &udpReceiver{
-		conn:     conn,
-		raw:      rawConn,
-		ownsConn: ownsConn,
-		buffers:  make([][]byte, batchSize),
-		names:    make([]rawSockaddrInet4, batchSize),
-		iovecs:   make([]syscall.Iovec, batchSize),
-		messages: make([]mmsghdr, batchSize),
+		conn:        conn,
+		raw:         rawConn,
+		ownsConn:    ownsConn,
+		buffers:     make([][]byte, batchSize),
+		controls:    make([][]byte, batchSize),
+		names:       make([]rawSockaddrInet4, batchSize),
+		iovecs:      make([]syscall.Iovec, batchSize),
+		messages:    make([]mmsghdr, batchSize),
+		dropTracker: dropTracker,
 	}
 
 	for index := 0; index < batchSize; index++ {
 		receiver.buffers[index] = make([]byte, maxUDPPacketSize)
+		receiver.controls[index] = make([]byte, controlSize)
 		receiver.iovecs[index] = syscall.Iovec{
 			Base: &receiver.buffers[index][0],
 			Len:  uint64(len(receiver.buffers[index])),
@@ -76,6 +97,8 @@ func newUDPReceiver(conn *net.UDPConn, rawConn syscall.RawConn, batchSize int, o
 		receiver.messages[index].Hdr.Namelen = uint32(unsafe.Sizeof(receiver.names[index]))
 		receiver.messages[index].Hdr.Iov = &receiver.iovecs[index]
 		receiver.messages[index].Hdr.Iovlen = 1
+		receiver.messages[index].Hdr.Control = &receiver.controls[index][0]
+		receiver.messages[index].Hdr.Controllen = uint64(len(receiver.controls[index]))
 	}
 
 	return receiver
@@ -93,7 +116,11 @@ func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, 
 				if reusePort {
 					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soReusePort, 1); err != nil {
 						controlErr = fmt.Errorf("setsockopt_so_reuseport_error: %w", err)
+						return
 					}
+				}
+				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soRXQOverflow, 1); err != nil {
+					controlErr = fmt.Errorf("setsockopt_so_rxq_ovfl_error: %w", err)
 				}
 			}); err != nil {
 				return err
@@ -123,11 +150,11 @@ func openUDPReceiver(listenAddress string, reusePort bool, readBufferBytes int, 
 		return nil, err
 	}
 
-	return newUDPReceiver(conn, rawConn, batchSize, true), nil
+	return newUDPReceiver(conn, rawConn, batchSize, true, nil), nil
 }
 
 func cloneUDPReceiver(receiver *udpReceiver, batchSize int) *udpReceiver {
-	return newUDPReceiver(receiver.conn, receiver.raw, batchSize, false)
+	return newUDPReceiver(receiver.conn, receiver.raw, batchSize, false, receiver.dropTracker)
 }
 
 func buildReusePortCBPF(socketCount int, hashOffsets []int) ([]syscall.SockFilter, error) {
@@ -210,6 +237,32 @@ func (receiver *udpReceiver) Close() error {
 	return receiver.conn.Close()
 }
 
+func (receiver *udpReceiver) ObserveSocketDrops(value uint32) uint64 {
+	for {
+		state := atomic.LoadUint64(&receiver.dropTracker.state)
+		nextState := uint64(1)<<32 | uint64(value)
+		if state == 0 {
+			if atomic.CompareAndSwapUint64(&receiver.dropTracker.state, 0, nextState) {
+				return uint64(value)
+			}
+			continue
+		}
+
+		previous := uint32(state)
+		if previous == value {
+			return 0
+		}
+		delta := value - previous
+		// A delta over half the uint32 range is an older cmsg read concurrently.
+		if delta > 1<<31 {
+			return 0
+		}
+		if atomic.CompareAndSwapUint64(&receiver.dropTracker.state, state, nextState) {
+			return uint64(delta)
+		}
+	}
+}
+
 func (receiver *udpReceiver) ReadBatch(results []UDPReadResult) (int, error) {
 	maxBatch := len(receiver.messages)
 	if len(results) < maxBatch {
@@ -245,6 +298,7 @@ func (receiver *udpReceiver) recvmmsg(fd uintptr, results []UDPReadResult) (int,
 		receiver.messages[index].Len = 0
 		receiver.messages[index].Hdr.Namelen = uint32(unsafe.Sizeof(receiver.names[index]))
 		receiver.messages[index].Hdr.Flags = 0
+		receiver.messages[index].Hdr.Controllen = uint64(len(receiver.controls[index]))
 	}
 
 	n, _, errno := syscall.Syscall6(
@@ -265,12 +319,31 @@ func (receiver *udpReceiver) recvmmsg(fd uintptr, results []UDPReadResult) (int,
 		name := receiver.names[index]
 		port := uint16(name.Port[0])<<8 | uint16(name.Port[1])
 		ipNum := binary.BigEndian.Uint32(name.Addr[:])
-		results[index] = UDPReadResult{
+		result := UDPReadResult{
 			Data:        receiver.buffers[index][:receiver.messages[index].Len],
 			RouterIP:    net.IPv4(name.Addr[0], name.Addr[1], name.Addr[2], name.Addr[3]).String(),
 			RouterIPNum: ipNum,
 			RouterPort:  port,
 		}
+		controlLength := int(receiver.messages[index].Hdr.Controllen)
+		if controlLength > len(receiver.controls[index]) {
+			controlLength = len(receiver.controls[index])
+		}
+		if controlLength > 0 {
+			messages, parseErr := syscall.ParseSocketControlMessage(receiver.controls[index][:controlLength])
+			if parseErr == nil {
+				for _, message := range messages {
+					if message.Header.Level == syscall.SOL_SOCKET &&
+						message.Header.Type == soRXQOverflow &&
+						len(message.Data) >= 4 {
+						result.SocketDrops = binary.LittleEndian.Uint32(message.Data[:4])
+						result.HasSocketDrops = true
+						break
+					}
+				}
+			}
+		}
+		results[index] = result
 	}
 
 	return count, nil

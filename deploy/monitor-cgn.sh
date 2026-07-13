@@ -5,6 +5,7 @@ set -u
 PORT="${1:-9088}"
 SERVICE="${2:-huawei-cgn-go-test}"
 FAILED_DIR="${3:-/index2/huawei-cgn-go-test/failed}"
+ALERT_DIR="${4:-/index2/huawei-cgn-go-test/alerts}"
 
 echo "=== FECHA ==="
 date
@@ -38,29 +39,39 @@ printf '%s\n' "$METRICS" | awk '
     if (pair[1] != "") value[pair[1]]=pair[2]
   }
   keys[1]="total_received"
-  keys[2]="total_packet_processed"
-  keys[3]="total_parsed"
-  keys[4]="total_inserted"
-  keys[5]="total_packet_queue_drops"
-  keys[6]="total_insert_errors"
-  keys[7]="total_failed_batch_spooled"
-  keys[8]="total_failed_rows_spooled"
-  keys[9]="total_failed_spool_errors"
-  keys[10]="pps_received_10s"
-  keys[11]="pps_packet_processed_10s"
-  keys[12]="rps_parsed_10s"
-  keys[13]="rps_inserted_10s"
-  keys[14]="queue_packet"
-  keys[15]="queue_batch"
-  keys[16]="workers_packet"
-  keys[17]="workers_insert"
-  keys[18]="udp_read_batches_10s"
-  keys[19]="udp_average_batch_10s"
-  keys[20]="udp_full_batch_pct_10s"
-  keys[21]="udp_read_errors_10s"
-  keys[22]="udp_receiver_min_10s"
-  keys[23]="udp_receiver_max_10s"
-  for (i=1; i<=23; i++) printf "%-35s %s\n", keys[i], value[keys[i]]
+  keys[2]="total_udp_kernel_drops"
+  keys[3]="total_packet_processed"
+  keys[4]="total_parsed"
+  keys[5]="total_inserted"
+  keys[6]="total_packet_queue_drops"
+  keys[7]="total_insert_errors"
+  keys[8]="total_failed_batch_spooled"
+  keys[9]="total_failed_rows_spooled"
+  keys[10]="total_failed_spool_errors"
+  keys[11]="pps_received_10s"
+  keys[12]="pps_packet_processed_10s"
+  keys[13]="rps_parsed_10s"
+  keys[14]="rps_inserted_10s"
+  keys[15]="queue_packet"
+  keys[16]="queue_batch"
+  keys[17]="workers_packet"
+  keys[18]="workers_insert"
+  keys[19]="udp_read_batches_10s"
+  keys[20]="udp_average_batch_10s"
+  keys[21]="udp_full_batch_pct_10s"
+  keys[22]="udp_read_errors_10s"
+  keys[23]="udp_kernel_drops_10s"
+  keys[24]="udp_receiver_min_10s"
+  keys[25]="udp_receiver_max_10s"
+  keys[26]="alerts_enabled"
+  keys[27]="alerts_mode"
+  keys[28]="alerts_active"
+  keys[29]="total_alerts_opened"
+  keys[30]="total_alerts_cleared"
+  keys[31]="total_alerts_delivered"
+  keys[32]="total_alert_delivery_errors"
+  keys[33]="alert_outbox_pending"
+  for (i=1; i<=33; i++) printf "%-35s %s\n", keys[i], value[keys[i]]
 }'
 echo
 
@@ -79,4 +90,14 @@ if [ -d "$FAILED_DIR" ]; then
   du -sh "$FAILED_DIR" 2>/dev/null
 else
   echo "FAILED_DIR no existe: $FAILED_DIR"
+fi
+echo
+
+echo "=== ALERT OUTBOX ==="
+if [ -d "$ALERT_DIR" ]; then
+  echo "outbox_files $(find "$ALERT_DIR/outbox" -type f -name '*.json' 2>/dev/null | wc -l)"
+  echo "quarantined_files $(find "$ALERT_DIR/bad" -type f 2>/dev/null | wc -l)"
+  du -sh "$ALERT_DIR" 2>/dev/null
+else
+  echo "ALERT_DIR no existe: $ALERT_DIR"
 fi

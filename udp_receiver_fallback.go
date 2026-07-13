@@ -55,6 +55,10 @@ func (receiver *udpReceiver) Close() error {
 	return receiver.conn.Close()
 }
 
+func (receiver *udpReceiver) ObserveSocketDrops(value uint32) uint64 {
+	return 0
+}
+
 func (receiver *udpReceiver) ReadBatch(results []UDPReadResult) (int, error) {
 	if len(results) == 0 {
 		return 0, fmt.Errorf("udp_batch_results_empty")

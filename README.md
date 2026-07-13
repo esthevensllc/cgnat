@@ -2,7 +2,8 @@
 
 Collector UDP escrito en Go para recibir eventos Huawei CGN NAT, insertar los
 eventos procesados en ClickHouse y preservar en disco los lotes que no pudieron
-insertarse.
+insertarse. Tambien puede detectar incumplimientos de recepcion, parseo e
+insercion y registrar su ciclo de vida en Oracle sin bloquear el camino UDP.
 
 El flujo de alto trafico en Linux usa varios sockets independientes
 `SO_REUSEPORT` y un selector BPF por contenido
@@ -44,7 +45,7 @@ ClickHouse despues de todos los reintentos.
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-go build -trimpath -ldflags="-s -w" -o bin/huawei-cgn-go .
+go build -mod=vendor -trimpath -ldflags="-s -w" -o bin/huawei-cgn-go .
 ```
 
 Al arrancar, el log debe mostrar:
@@ -80,13 +81,76 @@ los sockets reciben trafico. `pps_received_10s` ya expresa paquetes por segundo;
 el campo historico `rate_received_10s` conserva el total de los ultimos diez
 segundos por compatibilidad.
 
+## Alertas y Oracle
+
+Las alertas estan deshabilitadas por defecto. Su flujo es independiente:
+
+```text
+cohortes por segundo -> evaluador -> estado durable -> outbox -> Oracle
+```
+
+No se ejecuta SQL por paquete ni por registro NAT. Si Oracle no responde, el
+collector sigue recibiendo UDP e insertando en ClickHouse; los cambios de
+estado quedan en `ALERT_STATE_DIR/outbox` y se reintentan con backoff. El
+`MERGE` usa el UUID del incidente, por lo que un reintento no duplica la fila.
+
+Alertas implementadas:
+
+| Nombre | Indicador |
+| --- | --- |
+| `CGN_UDP_DROP_RATE_60S` | `SO_RXQ_OVFL / (recibidos + SO_RXQ_OVFL)` en los ultimos 60 s |
+| `CGN_PARSE_SLA_60S` | paquetes de la cohorte que no terminaron parseo 60 s despues de recibirse |
+| `CGN_INSERT_SLA_60S` | registros de la cohorte que ClickHouse no confirmo 60 s despues de recibirse |
+
+Paquetes y registros no se mezclan: la alerta de parseo usa paquetes y la de
+insercion usa registros NAT. Las dos alertas SLA empiezan a evaluarse cuando
+existe una ventana completa, aproximadamente 120 segundos despues del
+arranque con los valores predeterminados.
+
+Los umbrales iniciales son `0.1%` para drops UDP y `1%` para parseo e insercion.
+Una alerta se limpia despues de tres evaluaciones consecutivas por debajo de
+su umbral de recuperacion. El mismo `id` pasa de `ACTIVE` a `CLEARED`; no se
+crea una fila en cada evaluacion.
+
+Crear la tabla con [deploy/oracle-alerts.sql](deploy/oracle-alerts.sql). El
+campo solicitado como `%indicador` se llama `PORCENTAJE_INDICADOR`, porque `%`
+obligaria a usar un identificador Oracle entre comillas en todas las consultas.
+`FECHA_ENVIO` se asigna en Oracle con `SYSTIMESTAMP`.
+
+Preparar el directorio local:
+
+```bash
+mkdir -p /index2/huawei-cgn-go/alerts/{outbox,bad}
+chown -R huawei-cgn:huawei-cgn /index2/huawei-cgn-go/alerts
+chmod 750 /index2/huawei-cgn-go/alerts/{outbox,bad}
+```
+
+`ReadWritePaths` del unit systemd debe incluir exactamente ese directorio. La
+plantilla `deploy/huawei-cgn-go.service` ya incluye la ruta productiva; para un
+servicio de prueba con `/index2/huawei-cgn-go-test/alerts` hay que sustituirla y
+ejecutar `systemctl daemon-reload`.
+
+Primero ejecutar 24-48 horas sin escribir en Oracle:
+
+```text
+ALERTS_ENABLED=true
+ALERTS_MODE=observe
+ALERT_SERVER_IP=IP_DEL_COLLECTOR
+```
+
+Despues de validar los umbrales, completar `ORACLE_ALERT_*` y cambiar a
+`ALERTS_MODE=oracle`. El driver `go-ora` es puro Go y esta incluido en
+`vendor/`; no requiere Oracle Instant Client, CGO ni Internet durante la
+compilacion. El archivo de entorno contiene contrasenas y debe mantenerse con
+permisos `0600`.
+
 ## Simulador UDP
 
 Compilar el generador para ejecutarlo desde otro servidor:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-go build -trimpath -ldflags="-s -w" -o bin/udp-simulator ./cmd/udp-simulator
+go build -mod=vendor -trimpath -ldflags="-s -w" -o bin/udp-simulator ./cmd/udp-simulator
 ```
 
 Prueba fija:

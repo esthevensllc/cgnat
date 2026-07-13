@@ -79,10 +79,12 @@ type UDPPacket struct {
 }
 
 type UDPReadResult struct {
-	Data        []byte
-	RouterIP    string
-	RouterIPNum uint32
-	RouterPort  uint16
+	Data           []byte
+	RouterIP       string
+	RouterIPNum    uint32
+	RouterPort     uint16
+	SocketDrops    uint32
+	HasSocketDrops bool
 }
 
 type UDPReceiverStats struct {
@@ -90,12 +92,15 @@ type UDPReceiverStats struct {
 	Packets     uint64
 	FullBatches uint64
 	Errors      uint64
+	KernelDrops uint64
 }
 
 type InsertBatch struct {
-	TableName string
-	Body      []byte
-	Rows      int
+	TableName   string
+	Body        []byte
+	Rows        int
+	Cohorts     []insertCohort
+	CohortShard int
 }
 
 type FailedInsertBatchMeta struct {
@@ -1092,8 +1097,9 @@ func packetWorker(
 	}
 
 	type pendingBatch struct {
-		body []byte
-		rows int
+		body    []byte
+		rows    int
+		cohorts []insertCohort
 	}
 
 	pending := make(map[string]*pendingBatch, 2)
@@ -1109,7 +1115,13 @@ func packetWorker(
 			return
 		}
 
-		insertBatch := InsertBatch{TableName: tableName, Body: batch.body, Rows: batch.rows}
+		insertBatch := InsertBatch{
+			TableName:   tableName,
+			Body:        batch.body,
+			Rows:        batch.rows,
+			Cohorts:     batch.cohorts,
+			CohortShard: udpReceivers + workerID,
+		}
 		if sendInsertBatch(insertBatch, batches) {
 			pending[tableName] = newPendingBatch()
 			return
@@ -1120,6 +1132,9 @@ func packetWorker(
 		overloadErr := fmt.Errorf("live_insert_queue_overload queue_batch=%d/%d", len(batches), cap(batches))
 		if err := spoolFailedInsertBatch(insertBatch, overloadErr); err != nil {
 			atomic.AddUint64(&totalFailedSpoolErrors, 1)
+			if alertCohorts != nil {
+				alertCohorts.recordSpoolFailure(insertBatch.Cohorts, insertBatch.CohortShard, time.Now().Unix())
+			}
 			log.Printf(
 				"failed_insert_spool_error worker=%d table=%s rows=%d bytes=%d error=%v original_insert_error=%v",
 				workerID,
@@ -1129,6 +1144,8 @@ func packetWorker(
 				err,
 				overloadErr,
 			)
+		} else if alertCohorts != nil {
+			alertCohorts.recordSpooled(insertBatch.Cohorts, insertBatch.CohortShard, time.Now().Unix())
 		}
 		pending[tableName] = newPendingBatch()
 	}
@@ -1155,8 +1172,12 @@ func packetWorker(
 				packet.RouterPort,
 				packet.ReceivedUnixNano,
 			)
+			cohortSecond := packet.ReceivedUnixNano / int64(time.Second)
 			if err != nil {
 				atomic.AddUint64(&totalParseErrors, 1)
+				if alertCohorts != nil {
+					alertCohorts.recordParseResult(cohortSecond, udpReceivers+workerID, false, 0)
+				}
 				log.Printf(
 					"parse_error worker=%d router_ip=%s packet_size=%d error=%v",
 					workerID,
@@ -1165,6 +1186,9 @@ func packetWorker(
 					err,
 				)
 			} else {
+				if alertCohorts != nil {
+					alertCohorts.recordParseResult(cohortSecond, udpReceivers+workerID, true, uint64(len(entries)))
+				}
 				for _, entry := range entries {
 					tableName := dailyTableName(clickhouseTable, entry.EventTime)
 					batch := pending[tableName]
@@ -1184,6 +1208,9 @@ func packetWorker(
 					}
 
 					batch.rows++
+					if alertCohorts != nil {
+						batch.cohorts = addInsertCohort(batch.cohorts, cohortSecond, 1)
+					}
 					atomic.AddUint64(&totalParsed, 1)
 
 					if batch.rows >= insertBatchRows || len(batch.body) >= insertBatchBytes {
@@ -1390,6 +1417,9 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 			if lastErr == nil {
 				atomic.AddUint64(&totalInserted, uint64(batch.Rows))
 				atomic.AddUint64(&totalBatchesInserted, 1)
+				if alertCohorts != nil {
+					alertCohorts.recordInserted(batch.Cohorts, batch.CohortShard, time.Now().Unix())
+				}
 				break
 			}
 
@@ -1414,6 +1444,9 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 			atomic.AddUint64(&totalInsertDroppedRows, uint64(batch.Rows))
 			if err := spoolFailedInsertBatch(batch, lastErr); err != nil {
 				atomic.AddUint64(&totalFailedSpoolErrors, 1)
+				if alertCohorts != nil {
+					alertCohorts.recordSpoolFailure(batch.Cohorts, batch.CohortShard, time.Now().Unix())
+				}
 				log.Printf(
 					"failed_insert_spool_error worker=%d table=%s rows=%d bytes=%d error=%v original_insert_error=%v",
 					workerID,
@@ -1423,6 +1456,8 @@ func insertWorker(workerID int, batches <-chan InsertBatch, wg *sync.WaitGroup) 
 					err,
 					lastErr,
 				)
+			} else if alertCohorts != nil {
+				alertCohorts.recordSpooled(batch.Cohorts, batch.CohortShard, time.Now().Unix())
 			}
 			log.Printf(
 				"clickhouse_insert_failed worker=%d table=%s rows=%d bytes=%d error=%v failed_batch_reprocess_required=true",
@@ -1450,6 +1485,7 @@ func metricsLogger(
 	previousReceiverBatches := make([]uint64, len(receiverStats))
 	previousReceiverFullBatches := make([]uint64, len(receiverStats))
 	previousReceiverErrors := make([]uint64, len(receiverStats))
+	previousReceiverKernelDrops := make([]uint64, len(receiverStats))
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -1469,16 +1505,19 @@ func metricsLogger(
 			var receiverPacketsDelta uint64
 			var receiverFullBatchesDelta uint64
 			var receiverErrorsDelta uint64
+			var receiverKernelDropsDelta uint64
 			for index := range receiverStats {
 				packets := atomic.LoadUint64(&receiverStats[index].Packets)
 				readBatches := atomic.LoadUint64(&receiverStats[index].Batches)
 				fullBatches := atomic.LoadUint64(&receiverStats[index].FullBatches)
 				readErrors := atomic.LoadUint64(&receiverStats[index].Errors)
+				kernelDrops := atomic.LoadUint64(&receiverStats[index].KernelDrops)
 
 				packetsDelta := packets - previousReceiverPackets[index]
 				batchesDelta := readBatches - previousReceiverBatches[index]
 				fullBatchesDelta := fullBatches - previousReceiverFullBatches[index]
 				errorsDelta := readErrors - previousReceiverErrors[index]
+				kernelDropsDelta := kernelDrops - previousReceiverKernelDrops[index]
 
 				receiverDistribution[index] = strconv.Itoa(index+1) + ":" + strconv.FormatUint(packetsDelta, 10)
 				if index == 0 || packetsDelta < receiverPacketsMin {
@@ -1491,11 +1530,13 @@ func metricsLogger(
 				receiverBatchesDelta += batchesDelta
 				receiverFullBatchesDelta += fullBatchesDelta
 				receiverErrorsDelta += errorsDelta
+				receiverKernelDropsDelta += kernelDropsDelta
 
 				previousReceiverPackets[index] = packets
 				previousReceiverBatches[index] = readBatches
 				previousReceiverFullBatches[index] = fullBatches
 				previousReceiverErrors[index] = readErrors
+				previousReceiverKernelDrops[index] = kernelDrops
 			}
 
 			averageBatch := 0.0
@@ -1506,8 +1547,9 @@ func metricsLogger(
 			}
 
 			log.Printf(
-				"metrics live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only total_received=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d pps_received_10s=%d pps_packet_processed_10s=%d rps_parsed_10s=%d rps_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d udp_read_batches_10s=%d udp_average_batch_10s=%.2f udp_full_batch_pct_10s=%.2f udp_read_errors_10s=%d udp_receiver_min_10s=%d udp_receiver_max_10s=%d udp_receiver_packets_10s=%s",
+				"metrics live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only total_received=%d total_udp_kernel_drops=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d alerts_enabled=%t alerts_mode=%s alerts_active=%d total_alerts_opened=%d total_alerts_cleared=%d total_alerts_delivered=%d total_alert_delivery_errors=%d alert_outbox_pending=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d pps_received_10s=%d pps_packet_processed_10s=%d rps_parsed_10s=%d rps_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d udp_read_batches_10s=%d udp_average_batch_10s=%.2f udp_full_batch_pct_10s=%.2f udp_read_errors_10s=%d udp_kernel_drops_10s=%d udp_receiver_min_10s=%d udp_receiver_max_10s=%d udp_receiver_packets_10s=%s",
 				received,
+				atomic.LoadUint64(&totalUDPKernelDrops),
 				processed,
 				parsed,
 				inserted,
@@ -1524,6 +1566,14 @@ func metricsLogger(
 				atomic.LoadUint64(&totalFailedSpoolErrors),
 				atomic.LoadUint64(&totalTablesCreated),
 				atomic.LoadUint64(&totalTableCreateErrors),
+				alertConfig.Enabled,
+				alertConfig.Mode,
+				atomic.LoadInt64(&activeAlerts),
+				atomic.LoadUint64(&totalAlertsOpened),
+				atomic.LoadUint64(&totalAlertsCleared),
+				atomic.LoadUint64(&totalAlertsDelivered),
+				atomic.LoadUint64(&totalAlertDeliveryErrs),
+				atomic.LoadInt64(&alertOutboxPending),
 				received-previousReceived,
 				processed-previousPacketProcessed,
 				parsed-previousParsed,
@@ -1543,6 +1593,7 @@ func metricsLogger(
 				averageBatch,
 				fullBatchPct,
 				receiverErrorsDelta,
+				receiverKernelDropsDelta,
 				receiverPacketsMin,
 				receiverPacketsMax,
 				strings.Join(receiverDistribution, ","),
@@ -1702,6 +1753,8 @@ func loadConfig() {
 	liveInsertOverloadPolicy = strings.ToLower(getEnv("LIVE_INSERT_OVERLOAD_POLICY", "raw_only"))
 	liveInsertQueueHighWatermarkPct = getEnvInt("LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT", 95)
 	liveInsertSendTimeoutMS = getEnvInt("LIVE_INSERT_SEND_TIMEOUT_MS", 1)
+
+	alertConfig = loadAlertConfig(filepath.Dir(failedSpoolBase))
 }
 
 func validateConfig() {
@@ -1851,14 +1904,28 @@ func udpReadLoop(
 		}
 
 		receivedAt := time.Now().UnixNano()
+		receivedSecond := receivedAt / int64(time.Second)
 		for index := 0; index < count; index++ {
 			result := results[index]
 			bytesRead := len(result.Data)
 			if bytesRead == 0 {
 				continue
 			}
+			if result.HasSocketDrops {
+				dropped := receiver.ObserveSocketDrops(result.SocketDrops)
+				if dropped > 0 {
+					atomic.AddUint64(&stats.KernelDrops, dropped)
+					atomic.AddUint64(&totalUDPKernelDrops, dropped)
+					if alertCohorts != nil {
+						alertCohorts.recordUDPKernelDrops(receivedSecond, receiverID, dropped)
+					}
+				}
+			}
 
 			atomic.AddUint64(&totalReceived, 1)
+			if alertCohorts != nil {
+				alertCohorts.recordReceived(receivedSecond, receiverID)
+			}
 
 			packetBuffer := acquirePacketBuffer(bytesRead)
 			copy(packetBuffer, result.Data)
@@ -1888,6 +1955,22 @@ func main() {
 
 	if err := ensureFailedSpoolDirs(failedSpoolBase); err != nil {
 		log.Fatalf("failed_spool_directory_error error=%v", err)
+	}
+
+	var alerts *alertManager
+	if alertConfig.Enabled {
+		alertCohorts = newCohortTracker(
+			udpReceivers+autoTuneMaxPacketWorkers+1,
+			alertCohortRetention(alertConfig),
+		)
+		var err error
+		alerts, err = newAlertManager(alertConfig, alertCohorts)
+		if err != nil {
+			log.Printf("alerting_start_failed alerts_disabled=true error=%v", err)
+			alertCohorts = nil
+			alertConfig.Enabled = false
+			atomic.StoreInt64(&activeAlerts, 0)
+		}
 	}
 
 	readBufferBytes := udpReadBufferMB * 1024 * 1024
@@ -1941,6 +2024,7 @@ func main() {
 		}
 	}
 	defer closeUDPReceivers(receivers)
+	alerts.Start()
 	receiverStats := make([]UDPReceiverStats, len(receivers))
 
 	packetChannel := make(chan UDPPacket, packetChannelSize)
@@ -2015,7 +2099,7 @@ func main() {
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_reuseport_hash_offsets=%s udp_batch_size=%d packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
+		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_reuseport_hash_offsets=%s udp_batch_size=%d udp_rxq_overflow_metrics=true packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d alerts_enabled=%t alerts_mode=%s alert_window_seconds=%d alert_sla_seconds=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
@@ -2041,6 +2125,10 @@ func main() {
 		autoTuneMaxInsertWorkers,
 		liveInsertOverloadPolicy,
 		liveInsertQueueHighWatermarkPct,
+		alertConfig.Enabled,
+		alertConfig.Mode,
+		alertConfig.WindowSeconds,
+		alertConfig.SLASeconds,
 	)
 
 	readWG.Wait()
@@ -2050,5 +2138,6 @@ func main() {
 	packetWG.Wait()
 	close(insertBatches)
 	insertWG.Wait()
+	alerts.Stop()
 	log.Printf("collector_stopped")
 }
