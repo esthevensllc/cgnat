@@ -1754,7 +1754,12 @@ func loadConfig() {
 	liveInsertQueueHighWatermarkPct = getEnvInt("LIVE_INSERT_QUEUE_HIGH_WATERMARK_PCT", 95)
 	liveInsertSendTimeoutMS = getEnvInt("LIVE_INSERT_SEND_TIMEOUT_MS", 1)
 
-	alertConfig = loadAlertConfig(filepath.Dir(failedSpoolBase))
+	alertConfig = loadAlertConfig(
+		filepath.Dir(failedSpoolBase),
+		clickhouseURL,
+		clickhouseUser,
+		clickhousePass,
+	)
 }
 
 func validateConfig() {
