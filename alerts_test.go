@@ -16,6 +16,10 @@ type fakeAlertSink struct {
 	notify  chan struct{}
 }
 
+func (sink *fakeAlertSink) Prepare(_ context.Context) error {
+	return nil
+}
+
 func (sink *fakeAlertSink) Upsert(_ context.Context, record AlertRecord) error {
 	sink.mu.Lock()
 	sink.records = append(sink.records, record)
@@ -105,6 +109,49 @@ func TestAlertObservationsUseDelayedSLAWindow(t *testing.T) {
 	}
 }
 
+func TestNoTrafficObservationDoesNotRequireMinimumPackets(t *testing.T) {
+	config := testAlertConfig(t.TempDir())
+	config.WindowSeconds = 2
+	config.MinimumPackets = 1000
+	tracker := newCohortTracker(2, minimumCohortRetentionSeconds)
+	nowSecond := time.Now().Unix()
+	manager := &alertManager{
+		config:      config,
+		tracker:     tracker,
+		startSecond: nowSecond - 2,
+	}
+
+	observations := manager.observations(nowSecond)
+	noTraffic := observationByName(observations, alertNoUDPTrafficName)
+	if !noTraffic.Valid || noTraffic.Indicator != 100 {
+		t.Fatalf(
+			"no-traffic observation valid=%t indicator=%f, want true/100",
+			noTraffic.Valid,
+			noTraffic.Indicator,
+		)
+	}
+
+	tracker.recordReceived(nowSecond-1, 1)
+	observations = manager.observations(nowSecond)
+	noTraffic = observationByName(observations, alertNoUDPTrafficName)
+	if !noTraffic.Valid || noTraffic.Indicator != 0 {
+		t.Fatalf(
+			"traffic recovery observation valid=%t indicator=%f, want true/0",
+			noTraffic.Valid,
+			noTraffic.Indicator,
+		)
+	}
+}
+
+func observationByName(observations []alertObservation, name string) alertObservation {
+	for _, observation := range observations {
+		if observation.Name == name {
+			return observation
+		}
+	}
+	return alertObservation{}
+}
+
 func TestAlertLifecycleUsesOneIncidentID(t *testing.T) {
 	config := testAlertConfig(t.TempDir())
 	config.ClearWindows = 2
@@ -159,16 +206,16 @@ func TestAlertLifecycleUsesOneIncidentID(t *testing.T) {
 	}
 }
 
-func TestOracleTableNameValidation(t *testing.T) {
-	valid := []string{"CGNAT.COLLECTOR_ALERTS", "collector_alerts", "CGN$OPS.ALERT#1"}
+func TestClickHouseAlertTableNameValidation(t *testing.T) {
+	valid := []string{"cgnat.collector_alerts", "collector_alerts", "_ops.alert_1"}
 	for _, table := range valid {
-		if err := validateOracleTableName(table); err != nil {
+		if err := validateClickHouseTableName(table); err != nil {
 			t.Fatalf("valid table %q rejected: %v", table, err)
 		}
 	}
-	invalid := []string{"CGNAT.ALERTS;DROP TABLE X", "CGNAT..ALERTS", "1CGN.ALERTS", `"CGNAT"."ALERTS"`}
+	invalid := []string{"cgnat.alerts;DROP TABLE x", "cgnat..alerts", "1cgn.alerts", `"cgnat"."alerts"`}
 	for _, table := range invalid {
-		if err := validateOracleTableName(table); err == nil {
+		if err := validateClickHouseTableName(table); err == nil {
 			t.Fatalf("invalid table %q accepted", table)
 		}
 	}
@@ -190,10 +237,10 @@ func TestDirtyClearedStateIsReconciledOnStart(t *testing.T) {
 	manager := &alertManager{
 		config: AlertConfig{
 			Enabled:                   true,
-			Mode:                      alertModeOracle,
+			Mode:                      alertModeClickHouse,
 			ServerIP:                  "10.0.0.1",
 			EvaluationIntervalSeconds: 60,
-			Oracle: OracleAlertConfig{
+			ClickHouse: ClickHouseAlertConfig{
 				OperationTimeoutSeconds: 1,
 				RetrySeconds:            1,
 				MaxRetrySeconds:         2,
@@ -254,13 +301,17 @@ func testAlertConfig(directory string) AlertConfig {
 		TriggerWindows:            1,
 		ClearWindows:              3,
 		ActiveUpdateSeconds:       60,
+		NoTrafficEnabled:          true,
 		UDPThresholdPct:           0.1,
 		UDPClearPct:               0.01,
 		ParseThresholdPct:         1,
 		ParseClearPct:             0.1,
 		InsertThresholdPct:        1,
 		InsertClearPct:            0.1,
-		Oracle: OracleAlertConfig{
+		ClickHouse: ClickHouseAlertConfig{
+			URL:                     "http://127.0.0.1:8123",
+			Table:                   "cgnat.collector_alerts",
+			ConnectTimeoutSeconds:   5,
 			OperationTimeoutSeconds: 10,
 			RetrySeconds:            5,
 			MaxRetrySeconds:         300,

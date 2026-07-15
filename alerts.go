@@ -21,15 +21,16 @@ import (
 )
 
 const (
-	alertModeObserve = "observe"
-	alertModeOracle  = "oracle"
+	alertModeObserve    = "observe"
+	alertModeClickHouse = "clickhouse"
 
 	alertStateActive  = "ACTIVE"
 	alertStateCleared = "CLEARED"
 
-	alertUDPDropRateName = "CGN_UDP_DROP_RATE_60S"
-	alertParseSLAName    = "CGN_PARSE_SLA_60S"
-	alertInsertSLAName   = "CGN_INSERT_SLA_60S"
+	alertUDPDropRateName  = "CGN_UDP_DROP_RATE_60S"
+	alertNoUDPTrafficName = "CGN_NO_UDP_TRAFFIC_60S"
+	alertParseSLAName     = "CGN_PARSE_SLA_60S"
+	alertInsertSLAName    = "CGN_INSERT_SLA_60S"
 )
 
 type AlertConfig struct {
@@ -47,6 +48,7 @@ type AlertConfig struct {
 	TriggerWindows            int
 	ClearWindows              int
 	ActiveUpdateSeconds       int
+	NoTrafficEnabled          bool
 
 	UDPThresholdPct    float64
 	UDPClearPct        float64
@@ -55,7 +57,7 @@ type AlertConfig struct {
 	InsertThresholdPct float64
 	InsertClearPct     float64
 
-	Oracle OracleAlertConfig
+	ClickHouse ClickHouseAlertConfig
 }
 
 type AlertRecord struct {
@@ -95,6 +97,7 @@ type alertObservation struct {
 }
 
 type alertSink interface {
+	Prepare(context.Context) error
 	Upsert(context.Context, AlertRecord) error
 	Close() error
 }
@@ -153,7 +156,7 @@ func getEnvUint64(key string, defaultValue uint64) uint64 {
 	return number
 }
 
-func loadAlertConfig(defaultBaseDir string) AlertConfig {
+func loadAlertConfig(defaultBaseDir string, clickHouseURL string, clickHouseUser string, clickHousePass string) AlertConfig {
 	return AlertConfig{
 		Enabled: getEnvBool("ALERTS_ENABLED", false),
 		Mode:    strings.ToLower(getEnv("ALERTS_MODE", alertModeObserve)),
@@ -169,6 +172,7 @@ func loadAlertConfig(defaultBaseDir string) AlertConfig {
 		TriggerWindows:            getEnvInt("ALERT_TRIGGER_WINDOWS", 1),
 		ClearWindows:              getEnvInt("ALERT_CLEAR_WINDOWS", 3),
 		ActiveUpdateSeconds:       getEnvInt("ALERT_ACTIVE_UPDATE_SECONDS", 60),
+		NoTrafficEnabled:          getEnvBool("ALERT_NO_TRAFFIC_ENABLED", true),
 
 		UDPThresholdPct:    getEnvFloat("ALERT_UDP_DROP_THRESHOLD_PCT", 0.1),
 		UDPClearPct:        getEnvFloat("ALERT_UDP_DROP_CLEAR_PCT", 0.01),
@@ -177,7 +181,7 @@ func loadAlertConfig(defaultBaseDir string) AlertConfig {
 		InsertThresholdPct: getEnvFloat("ALERT_INSERT_THRESHOLD_PCT", 1.0),
 		InsertClearPct:     getEnvFloat("ALERT_INSERT_CLEAR_PCT", 0.1),
 
-		Oracle: loadOracleAlertConfig(),
+		ClickHouse: loadClickHouseAlertConfig(clickHouseURL, clickHouseUser, clickHousePass),
 	}
 }
 
@@ -185,8 +189,8 @@ func (config AlertConfig) validate() error {
 	if !config.Enabled {
 		return nil
 	}
-	if config.Mode != alertModeObserve && config.Mode != alertModeOracle {
-		return fmt.Errorf("ALERTS_MODE must be observe or oracle")
+	if config.Mode != alertModeObserve && config.Mode != alertModeClickHouse {
+		return fmt.Errorf("ALERTS_MODE must be observe or clickhouse")
 	}
 	if net.ParseIP(config.ServerIP) == nil {
 		return fmt.Errorf("ALERT_SERVER_IP must contain a valid IPv4 or IPv6 address")
@@ -221,8 +225,8 @@ func (config AlertConfig) validate() error {
 			return fmt.Errorf("%s alert clear percentage must be non-negative and lower than its threshold", value.name)
 		}
 	}
-	if config.Mode == alertModeOracle {
-		return config.Oracle.validate()
+	if config.Mode == alertModeClickHouse {
+		return config.ClickHouse.validate()
 	}
 	return nil
 }
@@ -268,8 +272,8 @@ func newAlertManager(config AlertConfig, tracker *cohortTracker) (*alertManager,
 	if err := manager.loadStates(); err != nil {
 		return nil, err
 	}
-	if config.Mode == alertModeOracle {
-		manager.sink, err = newOracleAlertSink(config.Oracle)
+	if config.Mode == alertModeClickHouse {
+		manager.sink, err = newClickHouseAlertSink(config.ClickHouse)
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +289,7 @@ func (manager *alertManager) Start() {
 
 	statesChanged := false
 	for _, state := range manager.states {
-		if !state.Dirty && !(manager.config.Mode == alertModeOracle && state.Active) {
+		if !state.Dirty && !(manager.config.Mode == alertModeClickHouse && state.Active) {
 			continue
 		}
 		if err := manager.emit(state.Record); err != nil {
@@ -304,7 +308,7 @@ func (manager *alertManager) Start() {
 		}
 	}
 
-	if manager.config.Mode == alertModeOracle {
+	if manager.config.Mode == alertModeClickHouse {
 		manager.wg.Add(1)
 		go manager.outboxWorker()
 	}
@@ -312,14 +316,16 @@ func (manager *alertManager) Start() {
 	manager.wg.Add(1)
 	go manager.evaluator()
 	log.Printf(
-		"alerting_started mode=%s server_ip=%s window_seconds=%d sla_seconds=%d udp_threshold_pct=%g parse_threshold_pct=%g insert_threshold_pct=%g state_dir=%s",
+		"alerting_started mode=%s server_ip=%s window_seconds=%d sla_seconds=%d no_traffic_enabled=%t udp_threshold_pct=%g parse_threshold_pct=%g insert_threshold_pct=%g clickhouse_alert_table=%s state_dir=%s",
 		manager.config.Mode,
 		manager.config.ServerIP,
 		manager.config.WindowSeconds,
 		manager.config.SLASeconds,
+		manager.config.NoTrafficEnabled,
 		manager.config.UDPThresholdPct,
 		manager.config.ParseThresholdPct,
 		manager.config.InsertThresholdPct,
+		manager.config.ClickHouse.Table,
 		manager.config.StateDir,
 	)
 }
@@ -332,7 +338,7 @@ func (manager *alertManager) Stop() {
 	manager.wg.Wait()
 	if manager.sink != nil {
 		if err := manager.sink.Close(); err != nil {
-			log.Printf("alert_oracle_close_error error=%v", err)
+			log.Printf("alert_sink_close_error error=%v", err)
 		}
 	}
 }
@@ -366,12 +372,29 @@ func (manager *alertManager) evaluate(now time.Time) {
 func (manager *alertManager) observations(nowSecond int64) []alertObservation {
 	window := int64(manager.config.WindowSeconds)
 	sla := int64(manager.config.SLASeconds)
-	result := make([]alertObservation, 0, 3)
+	result := make([]alertObservation, 0, 4)
 
 	udpEnd := nowSecond - 1
 	udpStart := udpEnd - window + 1
 	udpSnapshot := manager.tracker.snapshot(udpStart, udpEnd)
 	udpDenominator := udpSnapshot.ReceivedPackets + udpSnapshot.UDPKernelDrops
+	if manager.config.NoTrafficEnabled {
+		noTrafficIndicator := 0.0
+		noTrafficNumerator := uint64(0)
+		if udpSnapshot.ReceivedPackets == 0 {
+			noTrafficIndicator = 100
+			noTrafficNumerator = 1
+		}
+		result = append(result, alertObservation{
+			Name:           alertNoUDPTrafficName,
+			Threshold:      100,
+			ClearThreshold: 1,
+			Indicator:      noTrafficIndicator,
+			Numerator:      noTrafficNumerator,
+			Denominator:    1,
+			Valid:          udpStart >= manager.startSecond,
+		})
+	}
 	result = append(result, alertObservation{
 		Name:           alertUDPDropRateName,
 		Threshold:      manager.config.UDPThresholdPct,
@@ -650,10 +673,37 @@ func (manager *alertManager) enqueue(record AlertRecord) error {
 
 func (manager *alertManager) outboxWorker() {
 	defer manager.wg.Done()
-	retry := time.Duration(manager.config.Oracle.RetrySeconds) * time.Second
-	maximumRetry := time.Duration(manager.config.Oracle.MaxRetrySeconds) * time.Second
+	retry := time.Duration(manager.config.ClickHouse.RetrySeconds) * time.Second
+	maximumRetry := time.Duration(manager.config.ClickHouse.MaxRetrySeconds) * time.Second
+	prepared := false
 
 	for {
+		if !prepared {
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				time.Duration(manager.config.ClickHouse.OperationTimeoutSeconds)*time.Second,
+			)
+			err := manager.sink.Prepare(ctx)
+			cancel()
+			if err != nil {
+				atomic.AddUint64(&totalAlertDeliveryErrs, 1)
+				log.Printf("alert_clickhouse_prepare_error table=%s error=%v", manager.config.ClickHouse.Table, err)
+				select {
+				case <-time.After(retry):
+				case <-manager.stop:
+					return
+				}
+				retry *= 2
+				if retry > maximumRetry {
+					retry = maximumRetry
+				}
+				continue
+			}
+			prepared = true
+			log.Printf("alert_clickhouse_ready table=%s auto_create=%t", manager.config.ClickHouse.Table, manager.config.ClickHouse.AutoCreate)
+			retry = time.Duration(manager.config.ClickHouse.RetrySeconds) * time.Second
+		}
+
 		delivered, failed := manager.deliverOutbox()
 		if failed {
 			select {
@@ -667,7 +717,7 @@ func (manager *alertManager) outboxWorker() {
 			}
 			continue
 		}
-		retry = time.Duration(manager.config.Oracle.RetrySeconds) * time.Second
+		retry = time.Duration(manager.config.ClickHouse.RetrySeconds) * time.Second
 		wait := time.Second
 		if !delivered {
 			wait = 5 * time.Second
@@ -718,12 +768,12 @@ func (manager *alertManager) deliverOutbox() (bool, bool) {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(manager.config.Oracle.OperationTimeoutSeconds)*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(manager.config.ClickHouse.OperationTimeoutSeconds)*time.Second)
 		err = manager.sink.Upsert(ctx, record)
 		cancel()
 		if err != nil {
 			atomic.AddUint64(&totalAlertDeliveryErrs, 1)
-			log.Printf("alert_oracle_delivery_error name=%s state=%s id=%s error=%v", record.Name, record.State, record.ID, err)
+			log.Printf("alert_clickhouse_delivery_error name=%s state=%s id=%s error=%v", record.Name, record.State, record.ID, err)
 			return delivered, true
 		}
 		if err := os.Remove(path); err != nil {
@@ -733,7 +783,7 @@ func (manager *alertManager) deliverOutbox() (bool, bool) {
 		}
 		delivered = true
 		atomic.AddUint64(&totalAlertsDelivered, 1)
-		log.Printf("alert_oracle_delivered name=%s state=%s id=%s", record.Name, record.State, record.ID)
+		log.Printf("alert_clickhouse_delivered name=%s state=%s id=%s", record.Name, record.State, record.ID)
 	}
 	manager.refreshOutboxPending()
 	return delivered, false

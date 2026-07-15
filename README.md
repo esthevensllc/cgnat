@@ -1,22 +1,36 @@
 # Huawei CGN NAT Collector
 
 Collector UDP escrito en Go para recibir eventos Huawei CGN NAT, insertar los
-eventos procesados en ClickHouse y preservar en disco los lotes que no pudieron
-insertarse. Tambien puede detectar incumplimientos de recepcion, parseo e
-insercion y registrar su ciclo de vida en Oracle sin bloquear el camino UDP.
+registros procesados en ClickHouse y preservar en disco solamente los lotes que
+no pudieron insertarse. El mismo proceso detecta problemas de recepcion,
+parseo, insercion y ausencia total de trafico; las alertas se guardan en el
+mismo ClickHouse usado por los eventos NAT.
 
-El flujo de alto trafico en Linux usa varios sockets independientes
-`SO_REUSEPORT` y un selector BPF por contenido
-(`UDP_RECEIVE_MODE=reuseport_bpf`). El selector evita que todos los paquetes
-de un router pesado queden fijados al mismo socket. Los modos `reuseport` con
-hash normal del kernel y `shared_socket` se mantienen para diagnostico y
-reversion.
-La recepcion por lotes usa `recvmmsg` y workers adaptativos para parseo e insercion. La
-insercion live hacia ClickHouse usa `RowBinary` por HTTP y los `PACKET_WORKERS`
-arman los batches directamente, sin una cola central de eventos, para evitar
-que `queue_event` sea el cuello de botella.
+## Flujo principal
 
-## Configuracion
+En Linux, el modo recomendado para alto trafico es:
+
+```text
+UDP :9088
+  -> sockets SO_REUSEPORT
+  -> selector BPF por contenido
+  -> recvmmsg por lotes
+  -> PACKET_WORKERS
+       -> parseo Huawei
+       -> batches RowBinary directos
+  -> INSERT_WORKERS
+  -> ClickHouse
+```
+
+`UDP_RECEIVE_MODE=reuseport_bpf` evita que todos los datagramas de un router
+pesado queden fijados al mismo socket. Los modos `reuseport` y `shared_socket`
+se mantienen para diagnostico y reversion.
+
+La insercion NAT usa `RowBinary` por HTTP. No existe una cola central JSON en
+el camino live. Si un lote no puede insertarse despues de todos los reintentos,
+se escribe en `FAILED_SPOOL_BASE` para reproceso.
+
+## Configuracion general
 
 Crear la configuracion local a partir de la plantilla:
 
@@ -24,31 +38,42 @@ Crear la configuracion local a partir de la plantilla:
 cp huawei-cgn-go.example huawei-cgn-go
 ```
 
-Completar la URL, el usuario y la contrasena de ClickHouse. El archivo
-`huawei-cgn-go` contiene credenciales y esta excluido de Git.
+Completar como minimo:
 
-`CLICKHOUSE_TABLE` es el nombre base. Con `CLICKHOUSE_DAILY_TABLES=true` el
-collector inserta en tablas por dia con el formato:
+```ini
+LISTEN_ADDR=0.0.0.0:9088
+
+CLICKHOUSE_URL=http://CLICKHOUSE_HOST:8123
+CLICKHOUSE_USER=REEMPLAZAR_USUARIO
+CLICKHOUSE_PASS=REEMPLAZAR_CONTRASENA
+CLICKHOUSE_TABLE=cgnat.huawei_cgn_nat_v2
+CLICKHOUSE_DAILY_TABLES=true
+
+FAILED_SPOOL_BASE=/index2/huawei-cgn-go/failed
+```
+
+`CLICKHOUSE_TABLE` es el nombre base. Con tablas diarias activas, el collector
+crea e inserta en:
 
 ```text
 cgnat.huawei_cgn_nat_v2_YYYY_MM_DD
 ```
 
-Antes del primer insert de cada dia ejecuta `CREATE TABLE IF NOT EXISTS` con
-el esquema RowBinary esperado por el collector.
-
-El collector ya no guarda RAW/binarios de todos los paquetes. Solo escribe
-archivos RowBinary en `FAILED_SPOOL_BASE` cuando un lote no pudo insertarse en
-ClickHouse despues de todos los reintentos.
+El archivo con credenciales no debe publicarse y debe mantenerse con permisos
+restringidos.
 
 ## Compilacion
 
+El proyecto ya no tiene dependencias externas ni necesita `vendor/`. Para una
+compilacion offline:
+
 ```bash
+GOTOOLCHAIN=local GOPROXY=off \
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-go build -mod=vendor -trimpath -ldflags="-s -w" -o bin/huawei-cgn-go .
+go build -trimpath -ldflags="-s -w" -o bin/huawei-cgn-go .
 ```
 
-Al arrancar, el log debe mostrar:
+Al arrancar, el log debe incluir:
 
 ```text
 clickhouse_insert_format=RowBinary
@@ -56,97 +81,142 @@ live_batch_mode=packet_worker_direct
 clickhouse_daily_tables=true
 raw_spool_mode=failed_inserts_only
 udp_receive_mode=reuseport_bpf
-udp_reuse_port=true
-udp_reuseport_hash_offsets=20,36
+udp_rxq_overflow_metrics=true
 ```
 
-Tambien debe existir una linea anterior que confirme que el filtro se adjunto:
+En modo BPF tambien debe aparecer:
 
 ```text
 reuseport_bpf_attached sockets=16 hash_offsets=20,36 selector=cbpf_payload_hash
 ```
 
 `UDP_REUSEPORT_HASH_OFFSETS` se mide desde el primer byte del payload UDP. Los
-offsets `20,36` mezclan campos variables del primer registro Huawei y no
-dependen de los cuatro bytes del header. El modo requiere Linux 4.5 o superior;
-si el kernel rechaza el filtro, el collector termina durante el arranque para
-no ejecutar una prueba con balanceo aparente.
+offsets `20,36` mezclan campos variables del primer registro Huawei. El modo
+requiere Linux 4.5 o superior.
 
-En esta version `BATCH_BUILDERS` y `EVENT_CHANNEL_SIZE` quedan aceptados por
-compatibilidad, pero ya no controlan el camino caliente. Para validar carga,
-mirar principalmente `queue_packet`, `queue_batch`, `total_failed_batch_spooled`
-y `total_failed_spool_errors`. Las metricas `udp_receiver_packets_10s`,
-`udp_receiver_min_10s` y `udp_receiver_max_10s` permiten comprobar que todos
-los sockets reciben trafico. `pps_received_10s` ya expresa paquetes por segundo;
-el campo historico `rate_received_10s` conserva el total de los ultimos diez
-segundos por compatibilidad.
+## Alertas en ClickHouse
 
-## Alertas y Oracle
-
-Las alertas estan deshabilitadas por defecto. Su flujo es independiente:
+Las alertas estan deshabilitadas por defecto y tienen un flujo independiente:
 
 ```text
-cohortes por segundo -> evaluador -> estado durable -> outbox -> Oracle
+cohortes por segundo
+  -> evaluador
+  -> estado durable
+  -> alerts/outbox
+  -> ClickHouse
 ```
 
-No se ejecuta SQL por paquete ni por registro NAT. Si Oracle no responde, el
-collector sigue recibiendo UDP e insertando en ClickHouse; los cambios de
-estado quedan en `ALERT_STATE_DIR/outbox` y se reintentan con backoff. El
-`MERGE` usa el UUID del incidente, por lo que un reintento no duplica la fila.
+No se ejecuta una consulta por paquete ni por registro NAT. Solo se inserta una
+fila cuando una alerta cambia de estado o cuando debe persistirse un nuevo pico.
+La entrega usa una conexion HTTP y una cola diferentes a las del flujo NAT.
+
+Si ClickHouse no responde, el collector conserva los cambios en
+`ALERT_STATE_DIR/outbox` y continua recibiendo UDP. Cuando ClickHouse se
+recupera, la outbox se entrega en orden con reintentos exponenciales.
 
 Alertas implementadas:
 
-| Nombre | Indicador |
+| Nombre | Condicion |
 | --- | --- |
-| `CGN_UDP_DROP_RATE_60S` | `SO_RXQ_OVFL / (recibidos + SO_RXQ_OVFL)` en los ultimos 60 s |
-| `CGN_PARSE_SLA_60S` | paquetes de la cohorte que no terminaron parseo 60 s despues de recibirse |
-| `CGN_INSERT_SLA_60S` | registros de la cohorte que ClickHouse no confirmo 60 s despues de recibirse |
+| `CGN_NO_UDP_TRAFFIC_60S` | Ningun paquete recibido durante una ventana completa de 60 s |
+| `CGN_UDP_DROP_RATE_60S` | `SO_RXQ_OVFL / (recibidos + SO_RXQ_OVFL)` igual o mayor a `0.1%` |
+| `CGN_PARSE_SLA_60S` | Paquetes que no terminaron parseo 60 s despues de recibirse, igual o mayor a `1%` |
+| `CGN_INSERT_SLA_60S` | Registros que ClickHouse no confirmo 60 s despues de recibirse, igual o mayor a `1%` |
 
-Paquetes y registros no se mezclan: la alerta de parseo usa paquetes y la de
-insercion usa registros NAT. Las dos alertas SLA empiezan a evaluarse cuando
-existe una ventana completa, aproximadamente 120 segundos despues del
-arranque con los valores predeterminados.
+La alerta de ausencia de trafico no usa `ALERT_MIN_PACKETS`; queda habilitada
+con `ALERT_NO_TRAFFIC_ENABLED=true`. Espera una ventana completa despues del
+arranque antes de activarse. Si el proceso esta detenido, no puede emitir su
+propia alerta y ese caso debe vigilarse externamente con systemd o Prometheus.
 
-Los umbrales iniciales son `0.1%` para drops UDP y `1%` para parseo e insercion.
-Una alerta se limpia despues de tres evaluaciones consecutivas por debajo de
-su umbral de recuperacion. El mismo `id` pasa de `ACTIVE` a `CLEARED`; no se
-crea una fila en cada evaluacion.
+### Tabla de alertas
 
-Crear la tabla con [deploy/oracle-alerts.sql](deploy/oracle-alerts.sql). El
-campo solicitado como `%indicador` se llama `PORCENTAJE_INDICADOR`, porque `%`
-obligaria a usar un identificador Oracle entre comillas en todas las consultas.
-`FECHA_ENVIO` se asigna en Oracle con `SYSTIMESTAMP`.
-
-Preparar el directorio local:
-
-```bash
-mkdir -p /index2/huawei-cgn-go/alerts/{outbox,bad}
-chown -R huawei-cgn:huawei-cgn /index2/huawei-cgn-go/alerts
-chmod 750 /index2/huawei-cgn-go/alerts/{outbox,bad}
-```
-
-`ReadWritePaths` del unit systemd debe incluir exactamente ese directorio. La
-plantilla `deploy/huawei-cgn-go.service` ya incluye la ruta productiva; para un
-servicio de prueba con `/index2/huawei-cgn-go-test/alerts` hay que sustituirla y
-ejecutar `systemctl daemon-reload`.
-
-Primero ejecutar 24-48 horas sin escribir en Oracle:
+La tabla predeterminada es:
 
 ```text
-ALERTS_ENABLED=true
-ALERTS_MODE=observe
-ALERT_SERVER_IP=IP_DEL_COLLECTOR
+cgnat.collector_alerts
 ```
 
-Despues de validar los umbrales, completar `ORACLE_ALERT_*` y cambiar a
-`ALERTS_MODE=oracle`. El driver `go-ora` es puro Go y esta incluido en
-`vendor/`; no requiere Oracle Instant Client, CGO ni Internet durante la
-compilacion. El archivo de entorno contiene contrasenas y debe mantenerse con
-permisos `0600`.
+El collector puede crearla automaticamente con
+`CLICKHOUSE_ALERT_AUTO_CREATE=true`. El DDL tambien esta disponible en
+[deploy/clickhouse-alerts.sql](deploy/clickhouse-alerts.sql).
 
-## Opcion de despliegue completo en Linux sin Internet
+Se usa `ReplacingMergeTree(version)`: una alerta conserva el mismo `id` al
+pasar de `ACTIVE` a `CLEARED`. Hasta que ClickHouse complete sus merges pueden
+existir varias versiones fisicas. Para consultar el estado vigente se debe usar
+`FINAL`:
 
-Esta opcion asume las rutas usadas en el servidor de prueba:
+```sql
+SELECT
+    id,
+    hostname,
+    ip,
+    fecha_inicio,
+    fecha_fin,
+    nombre,
+    umbral,
+    porcentaje_indicador,
+    estado,
+    fecha_envio
+FROM cgnat.collector_alerts FINAL
+ORDER BY fecha_envio DESC
+LIMIT 100;
+```
+
+La entrega de alertas usa `JSONEachRow` porque su volumen es minimo y ya nace
+de una outbox JSON. Esto no cambia el camino live NAT, que continua usando
+`RowBinary`.
+
+### Configuracion de alertas
+
+Primero observar durante 24-48 horas sin escribir en ClickHouse:
+
+```ini
+ALERTS_ENABLED=true
+ALERTS_MODE=observe
+ALERT_SERVER_IP=IP_REAL_DEL_COLLECTOR
+ALERT_STATE_DIR=/index2/huawei-cgn-go/alerts
+
+ALERT_EVALUATION_INTERVAL_SECONDS=10
+ALERT_WINDOW_SECONDS=60
+ALERT_SLA_SECONDS=60
+ALERT_MIN_PACKETS=1000
+ALERT_MIN_ROWS=1000
+ALERT_TRIGGER_WINDOWS=1
+ALERT_CLEAR_WINDOWS=3
+ALERT_ACTIVE_UPDATE_SECONDS=60
+ALERT_NO_TRAFFIC_ENABLED=true
+
+ALERT_UDP_DROP_THRESHOLD_PCT=0.1
+ALERT_UDP_DROP_CLEAR_PCT=0.01
+ALERT_PARSE_THRESHOLD_PCT=1
+ALERT_PARSE_CLEAR_PCT=0.1
+ALERT_INSERT_THRESHOLD_PCT=1
+ALERT_INSERT_CLEAR_PCT=0.1
+```
+
+Despues de validar los umbrales, activar la entrega:
+
+```ini
+ALERTS_MODE=clickhouse
+
+CLICKHOUSE_ALERT_TABLE=cgnat.collector_alerts
+CLICKHOUSE_ALERT_AUTO_CREATE=true
+CLICKHOUSE_ALERT_CONNECT_TIMEOUT_SECONDS=5
+CLICKHOUSE_ALERT_OPERATION_TIMEOUT_SECONDS=10
+CLICKHOUSE_ALERT_RETRY_SECONDS=5
+CLICKHOUSE_ALERT_MAX_RETRY_SECONDS=300
+```
+
+El sink reutiliza `CLICKHOUSE_URL`, `CLICKHOUSE_USER` y `CLICKHOUSE_PASS`. No
+se necesitan otras credenciales, drivers ni servicios. Las variables antiguas
+`ORACLE_ALERT_*` ya no se usan.
+
+Los JSON que ya existan en `alerts/outbox` son compatibles con el nuevo sink y
+se entregaran a ClickHouse al arrancar en modo `clickhouse`.
+
+## Despliegue completo en Linux sin Internet
+
+Esta opcion asume el servicio de prueba y las siguientes rutas:
 
 ```text
 servicio:       huawei-cgn-go-test
@@ -157,77 +227,74 @@ failed spool:   /index2/huawei-cgn-go-test/failed
 alertas:        /index2/huawei-cgn-go-test/alerts
 ```
 
-Para produccion se deben sustituir el nombre del servicio y las rutas `-test`.
+Para produccion, sustituir el nombre del servicio y las rutas `-test`.
 
-### 1. Copiar el proyecto completo
+### 1. Copiar el proyecto
 
-El servidor sin Internet necesita el directorio `vendor/`. Se debe transferir
-el repositorio completo y no solamente los archivos `.go`:
+Transferir el repositorio completo a `/opt/huawei-cgn-go/src`. Los archivos
+necesarios para el collector son:
 
 ```text
 main.go
 alert_cohorts.go
 alerts.go
-oracle_alerts.go
+clickhouse_alerts.go
 reuseport_hash.go
 udp_receiver_linux_amd64.go
 udp_receiver_fallback.go
 go.mod
-go.sum
-vendor/
+deploy/
 ```
 
-Validar la dependencia Oracle vendorizada:
+No se necesita `vendor/`, `go.sum`, Oracle Instant Client ni acceso a Internet.
+No transferir archivos `.env` con credenciales al repositorio.
+
+Validar Go:
 
 ```bash
 cd /opt/huawei-cgn-go/src
-test -d vendor/github.com/sijms/go-ora/v2 && echo "vendor Oracle OK"
 /usr/local/go/bin/go version
 ```
 
-No se deben subir al repositorio archivos `.env` ni configuraciones que
-contengan contrasenas reales.
+### 2. Validar el ClickHouse existente
 
-### 2. Solicitar los datos y permisos Oracle
-
-El administrador de Oracle debe entregar:
-
-- IP o hostname de Oracle.
-- Puerto TCP, normalmente `1521`.
-- `SERVICE_NAME`.
-- Usuario y contrasena.
-- Esquema y nombre de la tabla.
-- Permisos `SELECT`, `INSERT` y `UPDATE` sobre la tabla.
-- Acceso de red desde el collector hasta Oracle.
-
-Validar primero el acceso TCP:
+Las alertas reutilizan la misma URL y credenciales de los eventos NAT. Desde el
+collector:
 
 ```bash
-nc -vz -w 5 IP_ORACLE 1521
+curl -sS --max-time 5 http://127.0.0.1:8123/ping
 ```
 
-El collector usa un driver Oracle puro Go incluido en `vendor/`. No requiere
-Oracle Instant Client, SQL*Plus, CGO ni descarga de paquetes. SQL*Plus es
-opcional y solo sirve para una validacion manual de la base.
-
-Esta configuracion cubre Oracle por TCP estandar. Si la base exige `TCPS`,
-wallet o certificados, se debe ampliar la configuracion antes del despliegue.
-
-### 3. Crear la tabla Oracle
-
-El DBA debe ejecutar `deploy/oracle-alerts.sql`, ajustando el esquema, tabla y
-usuario del `GRANT`. El valor final debe coincidir con
-`ORACLE_ALERT_TABLE`:
+Si `CLICKHOUSE_URL` usa otra IP o exige autenticacion, realizar la prueba con
+esa URL y el usuario configurado. La respuesta esperada es:
 
 ```text
-CGNAT.COLLECTOR_ALERTS
+Ok.
 ```
 
-La cuenta configurada en `ORACLE_ALERT_USER` debe estar habilitada, con la
-contrasena vigente y con permisos para ejecutar el `MERGE` de apertura y cierre
-de alertas.
+El usuario necesita `CREATE TABLE`, `INSERT` y `SELECT` sobre la base `cgnat`.
+Si ya crea las tablas NAT diarias, normalmente dispone de los permisos de
+creacion e insercion requeridos.
 
-### 4. Preparar los directorios locales
+### 3. Crear o validar la tabla de alertas
+
+Con `CLICKHOUSE_ALERT_AUTO_CREATE=true`, el worker de alertas ejecuta
+`CREATE TABLE IF NOT EXISTS` sin bloquear UDP. Para crearla manualmente:
+
+```bash
+cd /opt/huawei-cgn-go/src
+clickhouse-client --host 127.0.0.1 --user admin --password --multiquery \
+  < deploy/clickhouse-alerts.sql
+```
+
+Validar:
+
+```bash
+clickhouse-client --host 127.0.0.1 --user admin --password \
+  --query "DESCRIBE TABLE cgnat.collector_alerts"
+```
+
+### 4. Preparar los directorios
 
 ```bash
 install -d -o huawei-cgn -g huawei-cgn -m 0750 \
@@ -237,88 +304,73 @@ install -d -o huawei-cgn -g huawei-cgn -m 0750 \
   /index2/huawei-cgn-go-test/alerts \
   /index2/huawei-cgn-go-test/alerts/outbox \
   /index2/huawei-cgn-go-test/alerts/bad
-```
 
-Confirmar permisos:
-
-```bash
 namei -l /index2/huawei-cgn-go-test/alerts/outbox
 ```
 
-### 5. Configurar primero el modo de observacion
+### 5. Configurar el modo de observacion
 
-Agregar al archivo `/etc/huawei-cgn-go/huawei-cgn-go.env`:
+Agregar la configuracion de alertas mostrada anteriormente a:
+
+```text
+/etc/huawei-cgn-go/huawei-cgn-go.env
+```
+
+Para el primer arranque usar:
 
 ```ini
 ALERTS_ENABLED=true
 ALERTS_MODE=observe
-ALERT_SERVER_IP=IP_DEL_SERVIDOR_COLLECTOR
+ALERT_SERVER_IP=IP_REAL_DEL_COLLECTOR
 ALERT_STATE_DIR=/index2/huawei-cgn-go-test/alerts
-
-ALERT_EVALUATION_INTERVAL_SECONDS=10
-ALERT_WINDOW_SECONDS=60
-ALERT_SLA_SECONDS=60
-ALERT_MIN_PACKETS=1000
-ALERT_MIN_ROWS=1000
-ALERT_TRIGGER_WINDOWS=1
-ALERT_CLEAR_WINDOWS=3
-ALERT_ACTIVE_UPDATE_SECONDS=60
-
-ALERT_UDP_DROP_THRESHOLD_PCT=0.1
-ALERT_UDP_DROP_CLEAR_PCT=0.01
-ALERT_PARSE_THRESHOLD_PCT=1
-ALERT_PARSE_CLEAR_PCT=0.1
-ALERT_INSERT_THRESHOLD_PCT=1
-ALERT_INSERT_CLEAR_PCT=0.1
+ALERT_NO_TRAFFIC_ENABLED=true
 ```
 
-Proteger el archivo de configuracion:
+Proteger el archivo:
 
 ```bash
 chown root:huawei-cgn /etc/huawei-cgn-go/huawei-cgn-go.env
 chmod 640 /etc/huawei-cgn-go/huawei-cgn-go.env
 ```
 
-En modo `observe` se calculan y registran las alertas en `journald`, pero no se
-abre una conexion ni se escribe en Oracle.
-
 ### 6. Configurar systemd
 
 El unit `/etc/systemd/system/huawei-cgn-go-test.service` debe permitir escritura
-en las rutas exactas configuradas:
+en ambos spools:
 
 ```ini
 ReadWritePaths=-/index2/huawei-cgn-go-test/failed -/index2/huawei-cgn-go-test/alerts
 ```
 
-Aplicar el cambio:
+Aplicar y revisar:
 
 ```bash
 systemctl daemon-reload
 systemctl cat huawei-cgn-go-test
 ```
 
-Una ruta incorrecta o inexistente sin el prefijo `-` puede producir el error
-systemd `status=226/NAMESPACE`.
+Una ruta incorrecta o inexistente sin el prefijo `-` puede producir
+`status=226/NAMESPACE`.
 
-### 7. Compilar sin acceso a Internet
+### 7. Compilar offline
 
-Se puede compilar mientras la version anterior continua ejecutandose:
+Se puede compilar el binario nuevo mientras la version anterior sigue activa:
 
 ```bash
 cd /opt/huawei-cgn-go/src
 
-/usr/local/go/bin/go test -mod=vendor ./...
+GOTOOLCHAIN=local GOPROXY=off \
+/usr/local/go/bin/go test ./...
 
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOPROXY=off \
+GOTOOLCHAIN=local GOPROXY=off \
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 /usr/local/go/bin/go build \
-  -mod=vendor \
   -trimpath \
   -ldflags="-s -w" \
   -o /opt/huawei-cgn-go/bin/huawei-cgn-go.new .
 ```
 
-Validar el binario antes de detener el servicio:
+Validar antes de detener el servicio:
 
 ```bash
 file /opt/huawei-cgn-go/bin/huawei-cgn-go.new
@@ -326,10 +378,9 @@ sha256sum /opt/huawei-cgn-go/bin/huawei-cgn-go.new
 chmod 755 /opt/huawei-cgn-go/bin/huawei-cgn-go.new
 ```
 
-`file` debe indicar `ELF 64-bit`, `x86-64`. El build usa `CGO_ENABLED=0`, por
-lo que el binario no depende de librerias Oracle del sistema.
+`file` debe indicar `ELF 64-bit`, `x86-64` y un binario estatico.
 
-### 8. Reemplazar el binario y arrancar
+### 8. Reemplazar el binario
 
 ```bash
 systemctl stop huawei-cgn-go-test
@@ -345,95 +396,98 @@ systemctl start huawei-cgn-go-test
 systemctl status huawei-cgn-go-test --no-pager -l
 ```
 
-Validar el puerto, arranque y metricas:
+### 9. Validar el arranque
 
 ```bash
 ss -ulnp | grep ':9088'
 
 journalctl -u huawei-cgn-go-test -b --since "-5 minutes" --no-pager -l \
-  | grep -E 'collector_started|alerting_started|metrics|error'
+  | grep -E 'collector_started|alerting_started|alert_clickhouse|metrics|error'
 ```
 
-El arranque debe mostrar `alerts_enabled=true`, `alerts_mode=observe` y
-`udp_rxq_overflow_metrics=true`.
+En observacion debe verse:
 
-### 9. Observar antes de activar Oracle
+```text
+alerts_enabled=true
+alerts_mode=observe
+no_traffic_enabled=true
+```
 
-Mantener `ALERTS_MODE=observe` durante 24-48 horas y revisar:
+Revisar transiciones durante 24-48 horas:
 
 ```bash
 journalctl -u huawei-cgn-go-test -b --no-pager \
   | grep -E 'alert_transition|alert_observe' \
-  | tail -50
+  | tail -100
 ```
 
-Esto permite comprobar si los umbrales generan alertas utiles antes de escribir
-en la base externa.
+### 10. Activar ClickHouse
 
-### 10. Activar el envio a Oracle
-
-Agregar las credenciales al archivo de entorno:
+Cambiar el archivo de entorno:
 
 ```ini
-ALERTS_ENABLED=true
-ALERTS_MODE=oracle
-
-ORACLE_ALERT_HOST=IP_ORACLE
-ORACLE_ALERT_PORT=1521
-ORACLE_ALERT_SERVICE=SERVICE_NAME
-ORACLE_ALERT_USER=USUARIO
-ORACLE_ALERT_PASS=CONTRASENA
-ORACLE_ALERT_TABLE=CGNAT.COLLECTOR_ALERTS
-
-ORACLE_ALERT_CONNECT_TIMEOUT_SECONDS=5
-ORACLE_ALERT_OPERATION_TIMEOUT_SECONDS=10
-ORACLE_ALERT_RETRY_SECONDS=5
-ORACLE_ALERT_MAX_RETRY_SECONDS=300
+ALERTS_MODE=clickhouse
+CLICKHOUSE_ALERT_TABLE=cgnat.collector_alerts
+CLICKHOUSE_ALERT_AUTO_CREATE=true
+CLICKHOUSE_ALERT_CONNECT_TIMEOUT_SECONDS=5
+CLICKHOUSE_ALERT_OPERATION_TIMEOUT_SECONDS=10
+CLICKHOUSE_ALERT_RETRY_SECONDS=5
+CLICKHOUSE_ALERT_MAX_RETRY_SECONDS=300
 ```
 
-Los cambios del archivo de entorno requieren reiniciar el servicio:
+Reiniciar porque el archivo de entorno solo se carga al arrancar:
 
 ```bash
 systemctl restart huawei-cgn-go-test
 systemctl status huawei-cgn-go-test --no-pager -l
 ```
 
-### 11. Validar entregas y errores Oracle
+Validar la entrega:
 
 ```bash
 journalctl -u huawei-cgn-go-test -b --no-pager \
-  | grep -E 'alerting_started|alert_transition|alert_oracle|alert_outbox' \
+  | grep -E 'alerting_started|alert_transition|alert_clickhouse|alert_outbox' \
   | tail -100
 
 find /index2/huawei-cgn-go-test/alerts/outbox \
   -maxdepth 1 -type f -name '*.json' | wc -l
 ```
 
-Cuando exista una alerta, `alert_oracle_delivered` confirma que Oracle acepto
-el `MERGE`. Si Oracle no responde, aparece `alert_oracle_delivery_error`; el
-archivo permanece en `outbox` y el collector reintenta sin detener UDP ni
-ClickHouse.
+Mensajes importantes:
 
-El DBA puede comprobar las ultimas alertas con:
-
-```sql
-SELECT id,
-       hostname,
-       ip,
-       fecha_inicio,
-       fecha_fin,
-       nombre,
-       umbral,
-       porcentaje_indicador,
-       estado,
-       fecha_envio
-FROM cgnat.collector_alerts
-ORDER BY fecha_envio DESC;
+```text
+alert_clickhouse_ready
+alert_clickhouse_delivered
+alert_clickhouse_prepare_error
+alert_clickhouse_delivery_error
 ```
 
-### 12. Regresar al binario anterior
+Un error deja el archivo en `outbox`; no se pierde y no se detiene la captura
+UDP.
 
-Si la validacion del nuevo binario falla:
+### 11. Consultar las alertas
+
+```bash
+clickhouse-client --host 127.0.0.1 --user admin --password --query "
+SELECT
+    id, hostname, ip, fecha_inicio, fecha_fin,
+    nombre, umbral, porcentaje_indicador, estado, fecha_envio
+FROM cgnat.collector_alerts FINAL
+ORDER BY fecha_envio DESC
+LIMIT 100
+FORMAT Vertical"
+```
+
+Alertas activas:
+
+```sql
+SELECT *
+FROM cgnat.collector_alerts FINAL
+WHERE estado = 'ACTIVE'
+ORDER BY fecha_inicio DESC;
+```
+
+### 12. Rollback
 
 ```bash
 systemctl stop huawei-cgn-go-test
@@ -446,25 +500,55 @@ systemctl start huawei-cgn-go-test
 systemctl status huawei-cgn-go-test --no-pager -l
 ```
 
-## Simulador UDP
+## Monitor local
 
-Compilar el generador para ejecutarlo desde otro servidor:
+Instalar el monitor incluido:
 
 ```bash
+install -o root -g root -m 0755 \
+  /opt/huawei-cgn-go/src/deploy/monitor-cgn.sh \
+  /usr/local/bin/monitor-cgn.sh
+```
+
+Ejecutar una captura o actualizar cada dos segundos:
+
+```bash
+/usr/local/bin/monitor-cgn.sh
+watch -n 2 /usr/local/bin/monitor-cgn.sh
+```
+
+## Simulador UDP
+
+Compilar para ejecutarlo desde otro servidor:
+
+```bash
+GOTOOLCHAIN=local GOPROXY=off \
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-go build -mod=vendor -trimpath -ldflags="-s -w" -o bin/udp-simulator ./cmd/udp-simulator
+go build -trimpath -ldflags="-s -w" -o bin/udp-simulator ./cmd/udp-simulator
 ```
 
 Prueba fija:
 
 ```bash
-./bin/udp-simulator -target 10.96.167.132:9088 -mode legacy -pps 10000 -duration 5m -workers 8
+./bin/udp-simulator \
+  -target 10.96.167.132:9088 \
+  -mode legacy \
+  -pps 10000 \
+  -duration 5m \
+  -workers 8
 ```
 
 Prueba incremental:
 
 ```bash
-./bin/udp-simulator -target 10.96.167.132:9088 -mode multi -records 8 \
-  -start-pps 10000 -max-pps 200000 -step-pps 10000 -step-every 30s \
-  -duration 10m -workers 16
+./bin/udp-simulator \
+  -target 10.96.167.132:9088 \
+  -mode multi \
+  -records 8 \
+  -start-pps 10000 \
+  -max-pps 200000 \
+  -step-pps 10000 \
+  -step-every 30s \
+  -duration 10m \
+  -workers 16
 ```
