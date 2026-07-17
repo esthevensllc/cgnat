@@ -1,0 +1,36 @@
+[Unit]
+Description=Huawei CGN failed RowBinary reprocessor
+Wants=network-online.target
+After=network-online.target huawei-cgn-go.service
+
+[Service]
+Type=simple
+User=huawei-cgn
+Group=huawei-cgn
+WorkingDirectory=/opt/huawei-cgn-go
+EnvironmentFile=/etc/huawei-cgn-go/huawei-cgn-go.env
+EnvironmentFile=-/etc/huawei-cgn-go/huawei-cgn-failed-reprocessor.env
+ExecStart=/opt/huawei-cgn-go/bin/huawei-cgn-failed-reprocessor
+
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+LimitNOFILE=65536
+UMask=0027
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=-/index2/huawei-cgn-go/failed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=huawei-cgn-failed-reprocessor
+
+[Install]
+WantedBy=multi-user.target
