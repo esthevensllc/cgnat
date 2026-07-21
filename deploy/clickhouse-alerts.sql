@@ -1,3 +1,5 @@
+CREATE DATABASE IF NOT EXISTS cgnat;
+
 CREATE TABLE IF NOT EXISTS cgnat.collector_alerts
 (
     id UUID,

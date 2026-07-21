@@ -1,0 +1,32 @@
+[Unit]
+Description=Huawei CGN NAT UDP Collector (test)
+Wants=network-online.target clickhouse-server.service
+After=network-online.target clickhouse-server.service
+
+[Service]
+Type=simple
+User=huawei-cgn
+Group=huawei-cgn
+WorkingDirectory=/opt/huawei-cgn-go
+EnvironmentFile=/etc/huawei-cgn-go/huawei-cgn-go-test.env
+ExecStart=/opt/huawei-cgn-go/bin/huawei-cgn-go
+
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15min
+
+LimitNOFILE=1048576
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=-/index2/huawei-cgn-go-test/failed -/index2/huawei-cgn-go-test/alerts
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=huawei-cgn-go-test
+
+[Install]
+WantedBy=multi-user.target
