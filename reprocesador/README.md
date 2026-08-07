@@ -34,7 +34,7 @@ Solo se permite una instancia en Linux mediante el archivo de bloqueo
 Entrar en esta carpeta y compilar el modulo completo, no solamente `main.go`:
 
 ```bash
-cd /opt/huawei-cgn-go/src/reprocesador
+cd /opt/huawei-cgn-go/reprocesador
 
 GOTOOLCHAIN=local GOPROXY=off \
 /usr/local/go/bin/go test ./...
@@ -61,7 +61,7 @@ Los ajustes propios se guardan aparte:
 
 ```bash
 install -o root -g huawei-cgn -m 0640 \
-  /opt/huawei-cgn-go/src/reprocesador/deploy/huawei-cgn-failed-reprocessor.env.example \
+  /opt/huawei-cgn-go/reprocesador/deploy/huawei-cgn-failed-reprocessor.env.example \
   /etc/huawei-cgn-go/huawei-cgn-failed-reprocessor.env
 
 install -d -o huawei-cgn -g huawei-cgn -m 0750 \
@@ -122,7 +122,7 @@ este activo; la segunda instancia sera rechazada por el bloqueo.
 
 ```bash
 install -o root -g root -m 0644 \
-  /opt/huawei-cgn-go/src/reprocesador/deploy/huawei-cgn-failed-reprocessor.service \
+  /opt/huawei-cgn-go/reprocesador/deploy/huawei-cgn-failed-reprocessor.service \
   /etc/systemd/system/huawei-cgn-failed-reprocessor.service
 
 systemctl daemon-reload
