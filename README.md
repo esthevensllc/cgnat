@@ -500,6 +500,10 @@ varias versiones fisicas del mismo incidente.
 
 ## Diagnostico rapido
 
+El procedimiento para medir el consumo por columna y validar codecs sin
+arriesgar tablas productivas esta en
+[docs/runbooks/clickhouse-compresion.md](docs/runbooks/clickhouse-compresion.md).
+
 ```bash
 systemctl status huawei-cgn-go --no-pager -l
 journalctl -u huawei-cgn-go -b --since "-15 minutes" --no-pager -l
