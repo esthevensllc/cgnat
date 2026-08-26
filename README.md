@@ -14,7 +14,8 @@ Routers -> UDP 9088 -> SO_REUSEPORT + BPF -> recvmmsg por lotes
                                       +-> failed spool si no se inserta
 ```
 
-- Acepta cualquier header Huawei y paquetes con multiples registros.
+- Acepta cualquier header Huawei y paquetes con multiples registros; el header
+  se usa solo para validar el paquete y no se almacena en ClickHouse.
 - Distribuye trafico entre receptores UDP con `reuseport_bpf`.
 - Crea automaticamente la tabla NAT correspondiente a cada dia.
 - Inserta en ClickHouse sin JSON en el camino principal.
@@ -179,16 +180,11 @@ fecha manualmente, reemplazar `YYYY_MM_DD` por una fecha real, por ejemplo
 ```sql
 CREATE TABLE IF NOT EXISTS cgnat.huawei_cgn_nat_v2_YYYY_MM_DD
 (
-    event_time DateTime,
-    start_time DateTime,
+    start_time DateTime CODEC(ZSTD(3)),
     end_time DateTime,
-    event_id FixedString(40),
-    event_type String,
-    header String,
     router_ip IPv4,
     router_port UInt16,
     protocol_id UInt8,
-    protocol String,
     private_ip IPv4,
     private_port UInt16,
     public_ip IPv4,
@@ -200,7 +196,7 @@ CREATE TABLE IF NOT EXISTS cgnat.huawei_cgn_nat_v2_YYYY_MM_DD
 ENGINE = MergeTree
 ORDER BY
 (
-    event_time,
+    end_time,
     router_ip,
     private_ip,
     public_ip,
@@ -213,6 +209,20 @@ SETTINGS index_granularity = 8192;
 
 Para prueba se usa el mismo esquema cambiando el nombre por
 `cgnat.huawei_cgn_nat_v2_test_YYYY_MM_DD`.
+
+### Cambio al esquema reducido
+
+El esquema reduce almacenamiento al no persistir `event_id`, `event_time`,
+`event_type`, `header` ni `protocol`. La fecha de consulta se deriva de
+`end_time` y el protocolo de `protocol_id`.
+
+El collector no modifica una tabla existente. Desplegar este binario antes de
+que se cree la siguiente tabla diaria, o despues del cambio de dia. No iniciar
+el binario nuevo contra una tabla del dia actual con el esquema anterior:
+`RowBinary` tendria columnas diferentes y ClickHouse rechazaria el INSERT.
+
+Los lotes fallidos nuevos se marcan con `schema_version: 2`; el reprocesador
+actualizado conserva compatibilidad con lotes historicos sin esa propiedad.
 
 ### Tabla de alertas
 
@@ -409,8 +419,8 @@ Validar datos del dia actual, sustituyendo la fecha:
 ```sql
 SELECT
     count() AS registros,
-    min(event_time) AS primero,
-    max(event_time) AS ultimo
+    min(end_time) AS primero,
+    max(end_time) AS ultimo
 FROM cgnat.huawei_cgn_nat_v2_test_YYYY_MM_DD;
 ```
 

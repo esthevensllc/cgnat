@@ -206,12 +206,13 @@ func testConfig(t *testing.T, clickHouseURL string) config {
 
 func validTestMeta(bytes int) failedInsertBatchMeta {
 	return failedInsertBatchMeta{
-		CreatedTime: "2026-07-17 10:00:00",
-		TableName:   "cgnat.huawei_cgn_nat_v2_2026_07_17",
-		Rows:        23,
-		Bytes:       bytes,
-		Format:      "RowBinary",
-		Error:       "live_insert_queue_overload queue_batch=500/512",
+		SchemaVersion: reducedRowBinarySchema,
+		CreatedTime:   "2026-07-17 10:00:00",
+		TableName:     "cgnat.huawei_cgn_nat_v2_2026_07_17",
+		Rows:          23,
+		Bytes:         bytes,
+		Format:        "RowBinary",
+		Error:         "live_insert_queue_overload queue_batch=500/512",
 	}
 }
 

@@ -65,9 +65,13 @@ ORDER BY data_compressed_bytes DESC;
 ```
 
 Registrar el resultado antes de hacer una prueba. En particular, revisar
-`event_id`, `header`, `event_type`, `protocol` y los tres campos de fecha.
+`event_id`, `header`, `event_type`, `protocol`, `start_time` y `end_time`.
 
-## 3. Medir cardinalidad de las columnas de texto
+## 3. Medir cardinalidad de las columnas de texto historicas
+
+Esta medicion aplica solamente a tablas creadas con el esquema anterior. Las
+columnas que consulta no existen en las tablas nuevas con el esquema reducido;
+se conserva como referencia para analizar y migrar historia.
 
 Ejecutar preferentemente en un periodo sin carga. Para reducir el impacto,
 usar una hora representativa cambiando las fechas del filtro:
@@ -97,25 +101,20 @@ Interpretacion:
   un hash SHA-1 hexadecimal de 40 caracteres. Esto requiere ajustar consultas,
   portal y el contrato del collector, por lo que no es un cambio automatico.
 
-## 4. DDL candidato para una prueba
+## 4. DDL aprobado para tablas nuevas
 
-Crear una tabla de prueba con el mismo `ORDER BY` y solo codecs que hayan sido
-justificados por los pasos anteriores. El siguiente ejemplo es un punto de
-partida; `header` se deja como `String` hasta confirmar su cardinalidad.
+Las mediciones confirmaron que `event_id` domina el consumo. Se aprobó eliminar
+`event_id`, `event_time`, `event_type`, `header` y `protocol`. El portal deriva
+la fecha de evento desde `end_time` y el protocolo desde `protocol_id`.
 
 ```sql
 CREATE TABLE cgnat.huawei_cgn_nat_v2_comp_test
 (
-    event_time DateTime CODEC(Delta(4), ZSTD(3)),
     start_time DateTime CODEC(ZSTD(3)),
-    end_time DateTime CODEC(ZSTD(3)),
-    event_id FixedString(40) CODEC(ZSTD(3)),
-    event_type LowCardinality(String) CODEC(ZSTD(3)),
-    header String CODEC(ZSTD(3)),
+    end_time DateTime,
     router_ip IPv4,
     router_port UInt16,
     protocol_id UInt8,
-    protocol LowCardinality(String) CODEC(ZSTD(3)),
     private_ip IPv4,
     private_port UInt16,
     public_ip IPv4,
@@ -126,7 +125,7 @@ CREATE TABLE cgnat.huawei_cgn_nat_v2_comp_test
 )
 ENGINE = MergeTree
 ORDER BY (
-    event_time,
+    end_time,
     router_ip,
     private_ip,
     public_ip,
@@ -148,10 +147,13 @@ contra toda la historia sin medir primero el espacio y el impacto.
 
 ```sql
 INSERT INTO cgnat.huawei_cgn_nat_v2_comp_test
-SELECT *
+SELECT
+    start_time, end_time, router_ip, router_port, protocol_id,
+    private_ip, private_port, public_ip, public_port,
+    destination_ip, destination_port, packet_size
 FROM cgnat.huawei_cgn_nat_v2_2026_08_02
-WHERE event_time >= toDateTime('2026-08-02 10:00:00')
-  AND event_time <  toDateTime('2026-08-02 11:00:00');
+WHERE end_time >= toDateTime('2026-08-02 10:00:00')
+  AND end_time <  toDateTime('2026-08-02 11:00:00');
 ```
 
 Comparar las dos tablas:
@@ -190,8 +192,8 @@ Validar que el nuevo formato no afecte el uso real:
 ```sql
 SELECT
     count() AS filas,
-    min(event_time) AS primera_fecha,
-    max(event_time) AS ultima_fecha
+    min(end_time) AS primera_fecha,
+    max(end_time) AS ultima_fecha
 FROM cgnat.huawei_cgn_nat_v2_comp_test;
 ```
 
@@ -213,12 +215,11 @@ No usar `ALTER ... MODIFY COLUMN ... CODEC` sobre todos los dias en produccion
 como primer paso. La reescritura de partes consume I/O, CPU y espacio temporal,
 y puede competir con el collector y los merges.
 
-## 7. Optimizaciones que requieren una decision funcional
+## 7. Decisiones funcionales aplicadas
 
-- `protocol` duplica semanticamente `protocol_id`. Eliminarlo ahorra el 100%%
-  de esa columna, pero requiere actualizar todas las consultas que lo usan.
-- Reducir `event_id` a su hash binario puede ahorrar espacio si domina el
-  reporte por columna, pero cambia la representacion que consumen los clientes.
+- `protocol` se deriva desde `protocol_id` en el portal y no se almacena.
+- `event_id` se eliminó. No se podrá buscar ni correlacionar un registro por un
+  identificador unico.
 - Un `TTL` para eliminar, mover o exportar datos antiguos suele ser el mayor
   ahorro total de disco. Debe definirse primero la retencion requerida por el
   negocio.

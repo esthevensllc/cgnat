@@ -24,12 +24,13 @@ const failedDataSuffix = ".rowbinary.done"
 var errMetadataMissing = errors.New("metadata file is not available")
 
 type failedInsertBatchMeta struct {
-	CreatedTime string `json:"created_time"`
-	TableName   string `json:"table_name"`
-	Rows        int    `json:"rows"`
-	Bytes       int    `json:"bytes"`
-	Format      string `json:"format"`
-	Error       string `json:"error"`
+	SchemaVersion int    `json:"schema_version"`
+	CreatedTime   string `json:"created_time"`
+	TableName     string `json:"table_name"`
+	Rows          int    `json:"rows"`
+	Bytes         int    `json:"bytes"`
+	Format        string `json:"format"`
+	Error         string `json:"error"`
 }
 
 type candidate struct {
@@ -332,6 +333,11 @@ func loadCandidate(dataPath, metaPath string, modTime time.Time, actualSize int6
 	if !strings.EqualFold(meta.Format, "RowBinary") {
 		return candidate{}, fmt.Errorf("unsupported format %q", meta.Format)
 	}
+	schemaVersion, err := normalizeRowBinarySchema(meta.SchemaVersion)
+	if err != nil {
+		return candidate{}, err
+	}
+	meta.SchemaVersion = schemaVersion
 	if err := validateTableName(meta.TableName); err != nil {
 		return candidate{}, err
 	}
@@ -356,7 +362,7 @@ func loadCandidate(dataPath, metaPath string, modTime time.Time, actualSize int6
 func (r *reprocessor) processCandidate(ctx context.Context, workerID int, item candidate) error {
 	var lastErr error
 	for attempt := 1; attempt <= r.config.maxRetries; attempt++ {
-		if err := r.ensureTable(ctx, item.meta.TableName); err != nil {
+		if err := r.ensureTable(ctx, item.meta.TableName, item.meta.SchemaVersion); err != nil {
 			lastErr = fmt.Errorf("ensure table: %w", err)
 		} else {
 			lastErr = r.insertFile(ctx, item)
@@ -396,7 +402,7 @@ func (r *reprocessor) processCandidate(ctx context.Context, workerID int, item c
 	return lastErr
 }
 
-func (r *reprocessor) ensureTable(ctx context.Context, tableName string) error {
+func (r *reprocessor) ensureTable(ctx context.Context, tableName string, schemaVersion int) error {
 	if !r.config.autoCreateTable {
 		return nil
 	}
@@ -408,7 +414,7 @@ func (r *reprocessor) ensureTable(ctx context.Context, tableName string) error {
 		return nil
 	}
 
-	ddl, err := clickHouseCreateTableDDL(tableName)
+	ddl, err := clickHouseCreateTableDDL(tableName, schemaVersion)
 	if err != nil {
 		return err
 	}
@@ -452,7 +458,7 @@ func (r *reprocessor) insertFile(ctx context.Context, item candidate) error {
 	defer file.Close()
 
 	queryID := queryIDForFile(filepath.Base(item.dataPath))
-	insertURL, err := clickHouseInsertURL(r.config.clickHouseURL, item.meta.TableName, queryID)
+	insertURL, err := clickHouseInsertURL(r.config.clickHouseURL, item.meta.TableName, item.meta.SchemaVersion, queryID)
 	if err != nil {
 		return err
 	}

@@ -16,6 +16,10 @@ tabla diaria si no existe e inserta el cuerpo directamente con
 `FORMAT RowBinary`. Un lote se retira de `done` solamente despues de recibir
 una respuesta HTTP exitosa de ClickHouse.
 
+Los lotes nuevos incluyen `schema_version: 2` en su metadata y usan el esquema
+reducido. Los metadatos historicos sin esa propiedad se interpretan como la
+version 1, por lo que pueden reprocesarse con sus columnas originales.
+
 ## Estados de los archivos
 
 | Resultado | Accion |
@@ -158,5 +162,5 @@ seguros para reproceso. En cambio, un timeout ocurrido despues de enviar un
 INSERT puede ser ambiguo: ClickHouse podria haberlo confirmado internamente sin
 que el cliente recibiera la respuesta. Antes de reprocesar masivamente esos
 casos, revisar el campo `error` del JSON y definir una estrategia de
-deduplicacion basada en `event_id` o en la configuracion de deduplicacion de
-ClickHouse.
+deduplicacion basada en una clave de negocio o en la configuracion de
+deduplicacion de ClickHouse. El esquema reducido no conserva `event_id`.

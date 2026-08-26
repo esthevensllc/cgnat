@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -35,6 +34,7 @@ const (
 	udpModeReusePort    = "reuseport"
 	udpModeReusePortBPF = "reuseport_bpf"
 	udpModeShared       = "shared_socket"
+	rowBinarySchemaV2   = 2
 )
 
 var peruTZ = time.FixedZone("PET", -5*60*60)
@@ -53,13 +53,9 @@ type NATLogEntry struct {
 	EventTime       uint32
 	StartTime       uint32
 	EndTime         uint32
-	EventID         string
-	EventType       string
-	Header          string
 	RouterIP        uint32
 	RouterPort      uint16
 	ProtocolID      uint8
-	Protocol        string
 	PrivateIP       uint32
 	PrivatePort     uint16
 	PublicIP        uint32
@@ -104,12 +100,13 @@ type InsertBatch struct {
 }
 
 type FailedInsertBatchMeta struct {
-	CreatedTime string `json:"created_time"`
-	TableName   string `json:"table_name"`
-	Rows        int    `json:"rows"`
-	Bytes       int    `json:"bytes"`
-	Format      string `json:"format"`
-	Error       string `json:"error"`
+	SchemaVersion int    `json:"schema_version"`
+	CreatedTime   string `json:"created_time"`
+	TableName     string `json:"table_name"`
+	Rows          int    `json:"rows"`
+	Bytes         int    `json:"bytes"`
+	Format        string `json:"format"`
+	Error         string `json:"error"`
 }
 
 var (
@@ -319,19 +316,6 @@ func scaleStep(current int, max int, critical bool) int {
 	return step
 }
 
-func protocolName(protocolID uint8) string {
-	switch protocolID {
-	case 1:
-		return "ICMP"
-	case 6:
-		return "TCP"
-	case 17:
-		return "UDP"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 func ipv4BytesToUInt32(data []byte) uint32 {
 	return binary.BigEndian.Uint32(data)
 }
@@ -358,26 +342,6 @@ func appendUInt32(buffer []byte, value uint32) []byte {
 	var raw [4]byte
 	binary.LittleEndian.PutUint32(raw[:], value)
 	return append(buffer, raw[:]...)
-}
-
-func appendULEB128(buffer []byte, value uint64) []byte {
-	for value >= 0x80 {
-		buffer = append(buffer, byte(value)|0x80)
-		value >>= 7
-	}
-	return append(buffer, byte(value))
-}
-
-func appendRowBinaryString(buffer []byte, value string) []byte {
-	buffer = appendULEB128(buffer, uint64(len(value)))
-	return append(buffer, value...)
-}
-
-func appendRowBinaryFixedString(buffer []byte, value string, size int) ([]byte, error) {
-	if len(value) != size {
-		return buffer, fmt.Errorf("fixed_string_size_mismatch size=%d actual=%d value=%q", size, len(value), value)
-	}
-	return append(buffer, value...), nil
 }
 
 func isValidClickHouseIdentifier(value string) bool {
@@ -433,7 +397,7 @@ func dailyTableName(baseTable string, eventUnix uint32) string {
 
 func clickHouseInsertURL(tableName string) string {
 	query := fmt.Sprintf(
-		"INSERT INTO %s (event_time, start_time, end_time, event_id, event_type, header, router_ip, router_port, protocol_id, protocol, private_ip, private_port, public_ip, public_port, destination_ip, destination_port, packet_size) FORMAT RowBinary",
+		"INSERT INTO %s (start_time, end_time, router_ip, router_port, protocol_id, private_ip, private_port, public_ip, public_port, destination_ip, destination_port, packet_size) FORMAT RowBinary",
 		tableName,
 	)
 	return strings.TrimRight(clickhouseURL, "/") + "/?query=" + url.QueryEscape(query)
@@ -443,16 +407,11 @@ func clickHouseCreateTableDDL(tableName string) string {
 	return fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s
 (
-    event_time DateTime,
-    start_time DateTime,
+    start_time DateTime CODEC(ZSTD(3)),
     end_time DateTime,
-    event_id FixedString(40),
-    event_type String,
-    header String,
     router_ip IPv4,
     router_port UInt16,
     protocol_id UInt8,
-    protocol String,
     private_ip IPv4,
     private_port UInt16,
     public_ip IPv4,
@@ -462,7 +421,7 @@ CREATE TABLE IF NOT EXISTS %s
     packet_size UInt16
 )
 ENGINE = MergeTree
-ORDER BY (event_time, router_ip, private_ip, public_ip, destination_ip, private_port, public_port)
+ORDER BY (end_time, router_ip, private_ip, public_ip, destination_ip, private_port, public_port)
 SETTINGS index_granularity = 8192`, tableName)
 }
 
@@ -491,29 +450,8 @@ func timestampWithFallback(primary uint32, packetTimestamp uint32, receivedUnixN
 	return uint32(time.Now().Unix())
 }
 
-func makeEventID(entry NATLogEntry) string {
-	buffer := make([]byte, 0, 64)
-	buffer = appendUInt32(buffer, entry.EventTime)
-	buffer = appendUInt32(buffer, entry.StartTime)
-	buffer = appendUInt32(buffer, entry.EndTime)
-	buffer = appendUInt32(buffer, entry.RouterIP)
-	buffer = appendUInt8(buffer, entry.ProtocolID)
-	buffer = appendUInt32(buffer, entry.PrivateIP)
-	buffer = appendUInt16(buffer, entry.PrivatePort)
-	buffer = appendUInt32(buffer, entry.PublicIP)
-	buffer = appendUInt16(buffer, entry.PublicPort)
-	buffer = appendUInt32(buffer, entry.DestinationIP)
-	buffer = appendUInt16(buffer, entry.DestinationPort)
-	buffer = append(buffer, entry.Header...)
-	buffer = appendUInt16(buffer, entry.PacketSize)
-
-	sum := sha1.Sum(buffer)
-	return hex.EncodeToString(sum[:])
-}
-
 func parseMultiRecordPacket(
 	data []byte,
-	header string,
 	routerIP uint32,
 	routerPort uint16,
 	receivedUnixNano int64,
@@ -580,12 +518,9 @@ func parseMultiRecordPacket(
 			EventTime:       endTimestamp,
 			StartTime:       startTimestamp,
 			EndTime:         endTimestamp,
-			EventType:       "huawei_cgn_nat",
-			Header:          header,
 			RouterIP:        routerIP,
 			RouterPort:      routerPort,
 			ProtocolID:      protocolID,
-			Protocol:        protocolName(protocolID),
 			PrivateIP:       privateIP,
 			PrivatePort:     privatePort,
 			PublicIP:        publicIP,
@@ -595,7 +530,6 @@ func parseMultiRecordPacket(
 			PacketSize:      uint16(packetSize),
 		}
 
-		entry.EventID = makeEventID(entry)
 		entries = append(entries, entry)
 	}
 
@@ -604,7 +538,6 @@ func parseMultiRecordPacket(
 
 func parseLegacyPacket(
 	data []byte,
-	header string,
 	routerIP uint32,
 	routerPort uint16,
 	receivedUnixNano int64,
@@ -625,12 +558,9 @@ func parseLegacyPacket(
 		EventTime:       eventTimestamp,
 		StartTime:       eventTimestamp,
 		EndTime:         eventTimestamp,
-		EventType:       "huawei_cgn_nat",
-		Header:          header,
 		RouterIP:        routerIP,
 		RouterPort:      routerPort,
 		ProtocolID:      protocolID,
-		Protocol:        protocolName(protocolID),
 		PrivateIP:       ipv4BytesToUInt32(data[20:24]),
 		PrivatePort:     binary.BigEndian.Uint16(data[36:38]),
 		PublicIP:        ipv4BytesToUInt32(data[24:28]),
@@ -640,7 +570,6 @@ func parseLegacyPacket(
 		PacketSize:      uint16(len(data)),
 	}
 
-	entry.EventID = makeEventID(entry)
 	return []NATLogEntry{entry}, nil
 }
 
@@ -654,15 +583,12 @@ func parsePacket(
 		return nil, fmt.Errorf("packet_too_short_for_header packet_size=%d", len(data))
 	}
 
-	// Se acepta cualquier valor de header; se conserva para trazabilidad.
-	header := hex.EncodeToString(data[0:4])
 	packetSize := len(data)
 
 	if packetSize >= generalHeaderSize+recordSize &&
 		(packetSize-generalHeaderSize)%recordSize == 0 {
 		return parseMultiRecordPacket(
 			data,
-			header,
 			routerIP,
 			routerPort,
 			receivedUnixNano,
@@ -671,7 +597,6 @@ func parsePacket(
 
 	return parseLegacyPacket(
 		data,
-		header,
 		routerIP,
 		routerPort,
 		receivedUnixNano,
@@ -846,12 +771,13 @@ func spoolFailedInsertBatch(batch InsertBatch, insertErr error) error {
 	}
 
 	meta := FailedInsertBatchMeta{
-		CreatedTime: now.Format("2006-01-02 15:04:05"),
-		TableName:   batch.TableName,
-		Rows:        batch.Rows,
-		Bytes:       len(batch.Body),
-		Format:      "RowBinary",
-		Error:       insertErr.Error(),
+		SchemaVersion: rowBinarySchemaV2,
+		CreatedTime:   now.Format("2006-01-02 15:04:05"),
+		TableName:     batch.TableName,
+		Rows:          batch.Rows,
+		Bytes:         len(batch.Body),
+		Format:        "RowBinary",
+		Error:         insertErr.Error(),
 	}
 
 	metaJSON, err := json.MarshalIndent(meta, "", "  ")
@@ -1203,7 +1129,7 @@ func packetWorker(
 					if err != nil {
 						batch.body = batch.body[:beforeLen]
 						atomic.AddUint64(&totalEventMarshalError, 1)
-						log.Printf("event_rowbinary_error worker=%d event_id=%s error=%v", workerID, entry.EventID, err)
+						log.Printf("event_rowbinary_error worker=%d router_ip=%d end_time=%d error=%v", workerID, entry.RouterIP, entry.EndTime, err)
 						continue
 					}
 
@@ -1229,22 +1155,11 @@ func packetWorker(
 }
 
 func appendRowBinaryEvent(buffer []byte, entry NATLogEntry) ([]byte, error) {
-	buffer = appendUInt32(buffer, entry.EventTime)
 	buffer = appendUInt32(buffer, entry.StartTime)
 	buffer = appendUInt32(buffer, entry.EndTime)
-
-	var err error
-	buffer, err = appendRowBinaryFixedString(buffer, entry.EventID, 40)
-	if err != nil {
-		return buffer, err
-	}
-
-	buffer = appendRowBinaryString(buffer, entry.EventType)
-	buffer = appendRowBinaryString(buffer, entry.Header)
 	buffer = appendUInt32(buffer, entry.RouterIP)
 	buffer = appendUInt16(buffer, entry.RouterPort)
 	buffer = appendUInt8(buffer, entry.ProtocolID)
-	buffer = appendRowBinaryString(buffer, entry.Protocol)
 	buffer = appendUInt32(buffer, entry.PrivateIP)
 	buffer = appendUInt16(buffer, entry.PrivatePort)
 	buffer = appendUInt32(buffer, entry.PublicIP)
