@@ -35,6 +35,11 @@ func main() {
 	if err := processor.prepareDirectories(); err != nil {
 		log.Fatalf("prepare reprocessor: %v", err)
 	}
+	alerts, err := newReprocessAlertManager(cfg.alerts, cfg.doneDir, cfg.minAge)
+	if err != nil {
+		log.Fatalf("prepare reprocessor alerts: %v", err)
+	}
+	processor.alerts = alerts
 	releaseLock, err := acquireProcessLock(filepath.Join(cfg.spoolBase, ".failed-reprocessor.lock"))
 	if err != nil {
 		log.Fatalf("acquire reprocessor lock: %v", err)
@@ -42,7 +47,7 @@ func main() {
 	defer releaseLock()
 
 	log.Printf(
-		"reprocessor_started failed_spool=%s clickhouse_url=%s workers=%d poll_seconds=%.0f min_age_seconds=%.0f max_retries=%d scan_limit=%d success_action=%s auto_create_table=%t once=%t dry_run=%t",
+		"reprocessor_started failed_spool=%s clickhouse_url=%s workers=%d poll_seconds=%.0f min_age_seconds=%.0f max_retries=%d scan_limit=%d success_action=%s auto_create_table=%t alerts_enabled=%t alerts_mode=%s alert_backlog_sla_seconds=%.0f alert_table=%s once=%t dry_run=%t",
 		cfg.spoolBase,
 		cfg.clickHouseURL,
 		cfg.workers,
@@ -52,12 +57,20 @@ func main() {
 		cfg.scanLimit,
 		cfg.successAction,
 		cfg.autoCreateTable,
+		cfg.alerts.Enabled,
+		cfg.alerts.Mode,
+		cfg.alerts.BacklogSLA.Seconds(),
+		cfg.alerts.ClickHouse.Table,
 		once,
 		dryRun,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if !dryRun {
+		alerts.Start()
+		defer alerts.Stop()
+	}
 
 	if err := processor.run(ctx, once, processOptions{dryRun: dryRun, limit: limit}); err != nil {
 		log.Fatalf("reprocessor stopped with error: %v", err)

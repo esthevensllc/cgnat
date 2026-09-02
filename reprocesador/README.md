@@ -71,7 +71,10 @@ install -o root -g huawei-cgn -m 0640 \
 install -d -o huawei-cgn -g huawei-cgn -m 0750 \
   /index2/huawei-cgn-go/failed/done \
   /index2/huawei-cgn-go/failed/reprocessed \
-  /index2/huawei-cgn-go/failed/bad
+  /index2/huawei-cgn-go/failed/bad \
+  /index2/huawei-cgn-go/failed/alerts \
+  /index2/huawei-cgn-go/failed/alerts/outbox \
+  /index2/huawei-cgn-go/failed/alerts/bad
 ```
 
 Configuracion inicial conservadora:
@@ -88,11 +91,39 @@ REPROCESS_INTER_BATCH_DELAY_MS=250
 REPROCESS_AUTO_CREATE_TABLE=true
 REPROCESS_SUCCESS_ACTION=delete
 REPROCESS_ALLOW_HTTP_REDIRECT=false
+
+REPROCESS_ALERTS_ENABLED=true
+REPROCESS_ALERTS_MODE=clickhouse
+REPROCESS_ALERT_STATE_DIR=/index2/huawei-cgn-go/failed/alerts
+REPROCESS_ALERT_BACKLOG_SLA_SECONDS=300
 ```
 
 Mantener inicialmente un solo worker evita competir agresivamente con los
 inserts en vivo. Aumentarlo solo despues de medir ClickHouse, las colas del
 collector y el crecimiento de `failed/done`.
+
+## Alertas del reproceso
+
+El reprocesador escribe en la misma tabla ClickHouse configurada por el
+collector (`CLICKHOUSE_ALERT_TABLE`), pero usa su propio estado y outbox en
+`FAILED_SPOOL_BASE/alerts`. No genera alertas de UDP, ausencia de trafico ni
+parseo: esas metricas pertenecen exclusivamente al collector UDP.
+
+| Alerta | Condicion | Limpieza |
+|---|---|---|
+| `CGN_REPROCESS_BACKLOG_SLA` | Al menos 1% de lotes elegibles permanece en `failed/done` mas tiempo que `REPROCESS_ALERT_BACKLOG_SLA_SECONDS` (300 s por defecto). | Tres evaluaciones consecutivas bajo 0.01%, sin lotes vencidos. |
+| `CGN_REPROCESS_FAILURE_RATE_60S` | Al menos 1% de intentos de reproceso falla durante la ventana movil de 60 s. | Tres evaluaciones consecutivas bajo 0.01%, sin fallos en la ventana. |
+| `CGN_REPROCESS_QUARANTINE_RATE_60S` | Al menos 1% de lotes evaluados se mueve a `failed/bad` por metadata o contenido invalido. | Tres evaluaciones consecutivas bajo 0.01%, sin cuarentenas en la ventana. |
+
+Las alertas se evalúan cada 10 segundos. Con los valores por defecto, una
+alerta se abre en la primera evaluacion que supera el umbral y se limpia luego
+de aproximadamente 30 segundos de recuperacion, siempre que la ventana movil
+de 60 segundos ya no contenga fallos.
+
+El servicio hereda `ALERTS_ENABLED`, `ALERTS_MODE`, `ALERT_SERVER_IP`,
+`CLICKHOUSE_ALERT_TABLE` y las credenciales de ClickHouse desde el entorno del
+collector. Para aislarlo, definir los prefijos `REPROCESS_ALERT_*` en su propio
+archivo `.env`; revisar el archivo de ejemplo desplegable.
 
 ## Validar sin insertar
 
@@ -141,6 +172,26 @@ Monitorear el reproceso:
 
 ```bash
 journalctl -u huawei-cgn-failed-reprocessor -f
+
+journalctl -u huawei-cgn-failed-reprocessor -b --no-pager \
+  | grep -E 'reprocess_alert|reprocessor_metrics' | tail -30
+
+clickhouse-client -h 10.96.167.132 -u admin --password 'TU_PASSWORD' \
+  --query "
+SELECT
+    nombre,
+    estado,
+    fecha_inicio,
+    fecha_fin,
+    umbral,
+    porcentaje_indicador,
+    hostname,
+    ip
+FROM cgnat.collector_alerts FINAL
+WHERE nombre LIKE 'CGN_REPROCESS_%'
+ORDER BY fecha_envio DESC
+LIMIT 50
+"
 
 find /index2/huawei-cgn-go/failed/done \
   -maxdepth 1 -type f -name '*.rowbinary.done' | wc -l

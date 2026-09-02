@@ -71,6 +71,7 @@ type processOptions struct {
 type reprocessor struct {
 	config config
 	client *http.Client
+	alerts *reprocessAlertManager
 
 	tableMu      sync.Mutex
 	knownTables  map[string]struct{}
@@ -118,8 +119,9 @@ func (r *reprocessor) prepareDirectories() error {
 func (r *reprocessor) run(ctx context.Context, once bool, options processOptions) error {
 	for {
 		result, err := r.processCycle(ctx, options)
+		alertMetrics := r.alerts.Metrics()
 		log.Printf(
-			"reprocessor_metrics discovered=%d processed=%d inserted_rows=%d failed=%d quarantined=%d incomplete_pairs=%d too_recent=%d total_batches_inserted=%d total_rows_inserted=%d total_errors=%d",
+			"reprocessor_metrics discovered=%d processed=%d inserted_rows=%d failed=%d quarantined=%d incomplete_pairs=%d too_recent=%d total_batches_inserted=%d total_rows_inserted=%d total_errors=%d alerts_enabled=%t alerts_mode=%s alerts_active=%d total_alerts_opened=%d total_alerts_cleared=%d total_alerts_delivered=%d total_alert_delivery_errors=%d alert_outbox_pending=%d",
 			result.discovered,
 			result.processed,
 			result.insertedRows,
@@ -130,6 +132,14 @@ func (r *reprocessor) run(ctx context.Context, once bool, options processOptions
 			r.totalBatches,
 			r.totalRows,
 			r.totalErrors,
+			r.config.alerts.Enabled,
+			r.config.alerts.Mode,
+			alertMetrics.Active,
+			alertMetrics.Opened,
+			alertMetrics.Cleared,
+			alertMetrics.Delivered,
+			alertMetrics.DeliveryErrors,
+			alertMetrics.OutboxPending,
 		)
 		if once {
 			return err
@@ -253,6 +263,9 @@ func (r *reprocessor) processCycle(ctx context.Context, options processOptions) 
 		r.totalRows += rows
 	}
 
+	if !options.dryRun {
+		r.alerts.RecordCycle(time.Now(), result)
+	}
 	if result.failed > 0 {
 		return result, fmt.Errorf("reprocess cycle completed with %d failed items", result.failed)
 	}

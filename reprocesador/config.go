@@ -35,6 +35,7 @@ type config struct {
 	autoCreateTable   bool
 	successAction     string
 	allowHTTPRedirect bool
+	alerts            reprocessAlertConfig
 }
 
 func loadConfig() (config, error) {
@@ -111,6 +112,16 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("REPROCESS_SCAN_LIMIT cannot be negative")
 	}
 
+	alerts, err := loadReprocessAlertConfig(
+		spoolBase,
+		getEnv("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+		getEnv("CLICKHOUSE_USER", "admin"),
+		getEnv("CLICKHOUSE_PASS", ""),
+	)
+	if err != nil {
+		return config{}, err
+	}
+
 	return config{
 		clickHouseURL:     getEnv("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
 		clickHouseUser:    getEnv("CLICKHOUSE_USER", "admin"),
@@ -130,6 +141,7 @@ func loadConfig() (config, error) {
 		autoCreateTable:   autoCreateTable,
 		successAction:     successAction,
 		allowHTTPRedirect: allowHTTPRedirect,
+		alerts:            alerts,
 	}, nil
 }
 
