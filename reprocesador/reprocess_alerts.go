@@ -325,7 +325,7 @@ func newReprocessAlertManager(config reprocessAlertConfig, doneDir string, minim
 		startSecond: time.Now().Unix(),
 	}
 	for _, directory := range []string{config.StateDir, manager.outboxDir, manager.badDir} {
-		if err := ensureWritableDirectory(directory, 0750); err != nil {
+		if err := os.MkdirAll(directory, 0750); err != nil {
 			return nil, fmt.Errorf("reprocess_alert_directory_error directory=%s: %w", directory, err)
 		}
 	}

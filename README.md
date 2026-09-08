@@ -334,19 +334,20 @@ chmod 640 /etc/huawei-cgn-go/*.env
 
 ### Directorios de ejecucion
 
-No es necesario crear manualmente los subdirectorios operativos. Antes de abrir
-el puerto UDP, el collector crea y comprueba que puede escribir y eliminar un
-archivo de prueba en:
+Las unidades systemd incluidas ejecutan `mkdir -p` antes de iniciar el
+collector. Esta operacion es idempotente: crea una ruta faltante y, si ya
+existe como directorio, no modifica ni reemplaza los archivos que contiene.
+Las rutas preparadas son:
 
 - `FAILED_SPOOL_BASE/open` y `FAILED_SPOOL_BASE/done`.
 - `ALERT_STATE_DIR`, `ALERT_STATE_DIR/outbox` y `ALERT_STATE_DIR/bad`, cuando
   las alertas estan habilitadas.
 
-Si una ruta es un archivo, no puede crearse o el usuario `huawei-cgn` no puede
-escribir en ella, el servicio falla al inicio sin aceptar trafico UDP. Para una
-ruta distinta de las predeterminadas, crear su directorio padre con permisos
-para `huawei-cgn` y actualizar tambien `ReadWritePaths` en la unidad systemd;
-`ProtectSystem=full` bloquea rutas que no esten autorizadas alli.
+Si una ruta existe como archivo, no puede crearse o el usuario `huawei-cgn` no
+tiene permisos, el servicio falla antes de aceptar trafico UDP. Para una ruta
+distinta de las predeterminadas, actualizar las instrucciones `ExecStartPre` y
+`ReadWritePaths` en la unidad systemd; `ProtectSystem=full` bloquea rutas que
+no esten autorizadas alli.
 
 ## 8. Compilar el collector
 

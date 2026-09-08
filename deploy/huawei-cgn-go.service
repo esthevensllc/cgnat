@@ -9,6 +9,10 @@ User=huawei-cgn
 Group=huawei-cgn
 WorkingDirectory=/opt/huawei-cgn-go
 EnvironmentFile=/etc/huawei-cgn-go/huawei-cgn-go.env
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/open
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/done
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/alerts/outbox
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/alerts/bad
 ExecStart=/opt/huawei-cgn-go/bin/huawei-cgn-go
 
 Restart=always

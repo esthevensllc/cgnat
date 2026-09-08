@@ -10,6 +10,11 @@ Group=huawei-cgn
 WorkingDirectory=/opt/huawei-cgn-go
 EnvironmentFile=/etc/huawei-cgn-go/huawei-cgn-go.env
 EnvironmentFile=-/etc/huawei-cgn-go/huawei-cgn-failed-reprocessor.env
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/done
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/reprocessed
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/bad
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/alerts/outbox
+ExecStartPre=/usr/bin/mkdir -p -m 0750 /index2/huawei-cgn-go/failed/alerts/bad
 ExecStart=/opt/huawei-cgn-go/bin/huawei-cgn-failed-reprocessor
 
 Restart=on-failure
