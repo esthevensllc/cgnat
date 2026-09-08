@@ -109,8 +109,8 @@ func newReprocessor(cfg config) *reprocessor {
 
 func (r *reprocessor) prepareDirectories() error {
 	for _, directory := range []string{r.config.doneDir, r.config.archiveDir, r.config.badDir} {
-		if err := os.MkdirAll(directory, 0750); err != nil {
-			return fmt.Errorf("create directory %s: %w", directory, err)
+		if err := ensureWritableDirectory(directory, 0750); err != nil {
+			return fmt.Errorf("prepare reprocessor directory %s: %w", directory, err)
 		}
 	}
 	return nil

@@ -168,6 +168,13 @@ systemctl status huawei-cgn-failed-reprocessor --no-pager -l
 Si `FAILED_SPOOL_BASE` no es `/index2/huawei-cgn-go/failed`, ajustar tambien
 `ReadWritePaths` en el unit antes de iniciarlo.
 
+Al iniciar, el reprocesador crea y comprueba escritura en
+`FAILED_SPOOL_BASE/done`, `FAILED_SPOOL_BASE/reprocessed` y
+`FAILED_SPOOL_BASE/bad`. Con alertas habilitadas, tambien valida
+`REPROCESS_ALERT_STATE_DIR`, `outbox` y `bad`. Si alguna ruta no puede crearse,
+no es un directorio o no permite escritura para `huawei-cgn`, el servicio falla
+antes de iniciar un ciclo de reproceso.
+
 Monitorear el reproceso:
 
 ```bash

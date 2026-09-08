@@ -332,6 +332,22 @@ chown root:huawei-cgn /etc/huawei-cgn-go/*.env
 chmod 640 /etc/huawei-cgn-go/*.env
 ```
 
+### Directorios de ejecucion
+
+No es necesario crear manualmente los subdirectorios operativos. Antes de abrir
+el puerto UDP, el collector crea y comprueba que puede escribir y eliminar un
+archivo de prueba en:
+
+- `FAILED_SPOOL_BASE/open` y `FAILED_SPOOL_BASE/done`.
+- `ALERT_STATE_DIR`, `ALERT_STATE_DIR/outbox` y `ALERT_STATE_DIR/bad`, cuando
+  las alertas estan habilitadas.
+
+Si una ruta es un archivo, no puede crearse o el usuario `huawei-cgn` no puede
+escribir en ella, el servicio falla al inicio sin aceptar trafico UDP. Para una
+ruta distinta de las predeterminadas, crear su directorio padre con permisos
+para `huawei-cgn` y actualizar tambien `ReadWritePaths` en la unidad systemd;
+`ProtectSystem=full` bloquea rutas que no esten autorizadas alli.
+
 ## 8. Compilar el collector
 
 ```bash

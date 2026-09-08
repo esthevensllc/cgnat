@@ -606,8 +606,8 @@ func parsePacket(
 func ensureRawSpoolDirs(base string) error {
 	for _, directory := range []string{"open", "done"} {
 		path := filepath.Join(base, directory)
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("create_directory path=%s error=%w", path, err)
+		if err := ensureWritableDirectory(path, 0755); err != nil {
+			return fmt.Errorf("prepare_raw_spool_directory path=%s: %w", path, err)
 		}
 	}
 	return nil
@@ -714,8 +714,9 @@ func reportFatal(fatalErrors chan<- error, err error) {
 
 func ensureFailedSpoolDirs(base string) error {
 	for _, dir := range []string{"open", "done"} {
-		if err := os.MkdirAll(filepath.Join(base, dir), 0750); err != nil {
-			return err
+		path := filepath.Join(base, dir)
+		if err := ensureWritableDirectory(path, 0750); err != nil {
+			return fmt.Errorf("prepare_failed_spool_directory path=%s: %w", path, err)
 		}
 	}
 	return nil
