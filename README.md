@@ -503,6 +503,10 @@ evaluaciones consecutivas por debajo de su umbral de limpieza. Si ClickHouse no
 responde, los cambios de estado quedan en `ALERT_STATE_DIR/outbox` y se reenvian
 sin detener la captura UDP.
 
+El estado de una alerta activa se conserva en `ALERT_STATE_DIR/state.json`.
+Reiniciar el servicio no abre un incidente nuevo mientras ese archivo se
+conserve; no debe eliminarse durante una alerta activa.
+
 Consultar el ultimo estado de cada alerta:
 
 ```sql

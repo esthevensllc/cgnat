@@ -287,6 +287,46 @@ func TestDirtyClearedStateIsReconciledOnStart(t *testing.T) {
 	}
 }
 
+func TestCleanActiveStateIsNotReconciledOnStart(t *testing.T) {
+	directory := t.TempDir()
+	outboxDir := filepath.Join(directory, "outbox")
+	if err := os.MkdirAll(outboxDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().In(peruTZ)
+	manager := &alertManager{
+		config:    AlertConfig{Mode: alertModeClickHouse},
+		outboxDir: outboxDir,
+		states: map[string]*alertRuntimeState{
+			alertNoUDPTrafficName: {
+				Record: AlertRecord{
+					ID:        "a67c822d-6786-485a-b926-a10dacb78216",
+					Hostname:  "collector-1",
+					IP:        "10.0.0.1",
+					StartTime: now.Add(-time.Minute),
+					Name:      alertNoUDPTrafficName,
+					Threshold: 100,
+					Indicator: 100,
+					State:     alertStateActive,
+				},
+				Active: true,
+			},
+		},
+	}
+
+	if manager.reconcileDirtyStates() {
+		t.Fatal("clean active state must not be marked for delivery")
+	}
+	entries, err := os.ReadDir(outboxDir)
+	if err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("outbox entries = %d, want 0", len(entries))
+	}
+}
+
 func testAlertConfig(directory string) AlertConfig {
 	return AlertConfig{
 		Enabled:                   true,

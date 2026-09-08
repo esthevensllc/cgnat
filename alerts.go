@@ -287,22 +287,7 @@ func (manager *alertManager) Start() {
 	}
 	manager.startSecond = time.Now().Unix()
 
-	statesChanged := false
-	for _, state := range manager.states {
-		if !state.Dirty && !(manager.config.Mode == alertModeClickHouse && state.Active) {
-			continue
-		}
-		if err := manager.emit(state.Record); err != nil {
-			state.Dirty = true
-			statesChanged = true
-			continue
-		}
-		if state.Dirty {
-			state.Dirty = false
-			statesChanged = true
-		}
-	}
-	if statesChanged {
+	if manager.reconcileDirtyStates() {
 		if err := manager.persistStates(); err != nil {
 			log.Printf("alert_state_reconcile_error error=%v", err)
 		}
@@ -328,6 +313,25 @@ func (manager *alertManager) Start() {
 		manager.config.ClickHouse.Table,
 		manager.config.StateDir,
 	)
+}
+
+func (manager *alertManager) reconcileDirtyStates() bool {
+	statesChanged := false
+	for _, state := range manager.states {
+		if !state.Dirty {
+			continue
+		}
+		if err := manager.emit(state.Record); err != nil {
+			state.Dirty = true
+			statesChanged = true
+			continue
+		}
+		if state.Dirty {
+			state.Dirty = false
+			statesChanged = true
+		}
+	}
+	return statesChanged
 }
 
 func (manager *alertManager) Stop() {
