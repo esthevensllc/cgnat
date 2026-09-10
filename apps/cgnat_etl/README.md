@@ -1,7 +1,8 @@
 # ETL CGNAT: cuatro nodos hacia elog
 
 Proyecto para Python **3.7.4**, usando `clickhouse_connect` del entorno existente.
-Consulta los cuatro nodos secuencialmente y publica cinco tablas en
+Ejecuta los **cinco casos en paralelo**; dentro de cada caso consulta los cuatro
+nodos secuencialmente y publica su tabla en
 **172.19.242.107 / elog**. No requiere pandas ni dependencias adicionales a las
 que ya utiliza el driver. No instala ni actualiza paquetes del env.
 
@@ -140,6 +141,25 @@ Reprocesar solamente un caso, o consultar otra IP pública:
 /bin/sh /index1/tareas/proyectos_python/apps/run_cgnat_etl.sh --fecha 2026-08-01 --caso pool_ips_privadas --public-ip 179.6.75.138
 ```
 
+Sin `--caso` (o con `--caso todos`), los cinco casos arrancan en paralelo,
+con un hilo de Python dedicado a cada caso. Cada uno recorre los nodos
+`132 -> 133 -> 134 -> 135` en secuencia, usando conexiones propias tanto
+para los orígenes como para el destino. No hay pool de workers ni tareas
+paralelas por nodo dentro de un caso. Con `--caso nombre` se ejecuta solo ese caso.
+No se requieren cambios en el `config.ini`, shell o cron existentes para este modo.
+
+Puede haber hasta **cinco consultas de extracción simultáneas**, incluso todas
+en el mismo nodo. `max_threads = 2` se aplica a cada consulta, no al conjunto
+del ETL. Este paralelismo puede competir con el Go Collector por CPU, RAM y
+disco en los nodos origen. No constituye un límite de recursos reservado para
+la captura ni garantiza una reducción proporcional del tiempo total.
+
+El log identifica cada mensaje con su caso; sus líneas se intercalan porque
+avanzan de forma independiente. Cada caso publica su resultado al terminar
+los cuatro nodos, sin esperar a los otros casos. El proceso espera que todos
+terminen antes de liberar el bloqueo; si alguno falla, los demás continúan
+y al final se devuelve código 1.
+
 Entrada para `crontab -e`: diariamente a las **06:00**, como se solicitó.
 La ingestión del día anterior debe haber terminado a esa hora.
 
@@ -222,8 +242,9 @@ caída del destino puede dejar auxiliares: identificarlas mediante el log y
 `SHOW TABLES FROM elog LIKE '_cgnat_etl_%'`, comprobar que ninguna ejecución las
 usa y eliminar solamente esas tablas auxiliares abandonadas.
 
-Las consultas se ejecutan secuencialmente para moderar la carga. `max_threads`,
-`max_execution_time`, timeouts y lotes son configurables. Los bloques acotan
+Los nodos se consultan secuencialmente dentro de cada caso, mientras los casos
+avanzan en paralelo. `max_threads`, `max_execution_time`, timeouts y lotes son
+configurables. Los bloques acotan
 el buffer Python; `uniqExact` sigue necesitando memoria en ClickHouse según la
 cardinalidad. Programar sobre tablas con ingestión terminada: la lectura de
 cuatro servidores y cinco casos no constituye un snapshot transaccional global.
@@ -237,7 +258,9 @@ python3 -m unittest discover -s tests -v
 ```
 
 Cubren los cuatro nodos, fallos de lectura/escritura, lotes, recargas, vacíos,
-particiones por IP, fechas/zonas horarias y generación de consultas.
+particiones por IP, fechas/zonas horarias y generación de consultas. También
+verifican la concurrencia real de los cinco casos, el orden de sus nodos,
+la independencia y cierre de conexiones y el aislamiento de fallos entre casos.
 En el servidor, crear las tablas y ejecutar una carga controlada antes de
 habilitar cron. Comparar conteos por nodo y fecha, por ejemplo:
 

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
@@ -238,41 +239,68 @@ def initialize(destination):
     LOG.info("Esquema elog y cinco tablas inicializados")
 
 
+def open_client(stack, factory, options, name, case):
+    settings = options[name]
+    LOG.info("Conectando %s=%s:%d usuario=%s base=%s caso=%s", name, settings["host"],
+             settings["port"], settings["username"], settings["database"], case)
+    client = factory(**settings)
+    stack.callback(client.close)
+    return client
+
+
+def execute_case(config, case, data_date, public_ip, factory, options):
+    """Cada caso posee sus clientes, sesiones y auxiliar; no los comparte con otros hilos."""
+    try:
+        with ExitStack() as stack:
+            destination = open_client(stack, factory, options, "destino", case)
+            sources = []
+            for name in ("origen_1", "origen_2", "origen_3", "origen_4"):
+                client = open_client(stack, factory, options, name, case)
+                if not hasattr(client, "query_row_block_stream"):
+                    raise RuntimeError("clickhouse_connect instalado no soporta query_row_block_stream")
+                sources.append((name, client))
+            load_case(destination, sources, config, case, data_date, public_ip)
+        return True
+    except Exception as exc:
+        # No imprimir excepciones del driver: pueden incluir URL o datos sensibles.
+        LOG.error("Fallo caso=%s fecha=%s error=%s; no se confirma publicacion. "
+                  "Revisar query_log del servidor y repetir el caso.",
+                  case, data_date, type(exc).__name__)
+        return False
+
+
 def run(config, cases, data_date, public_ip, factory, init_db=False):
     names = [] if init_db else ["origen_1", "origen_2", "origen_3", "origen_4"]
-    # Validar todas las credenciales antes de abrir conexiones o escribir.
+    # Validar todas las credenciales antes de abrir conexiones o iniciar hilos.
     options = {name: connection_options(config, name) for name in ["destino"] + names}
-    with ExitStack() as stack:
-        LOG.info("Conectando destino=%s:%d usuario=%s base=%s", options["destino"]["host"],
-                 options["destino"]["port"], options["destino"]["username"],
-                 options["destino"]["database"])
-        destination = factory(**options["destino"])
-        stack.callback(destination.close)
-        if init_db:
+    if init_db:
+        with ExitStack() as stack:
+            destination = open_client(stack, factory, options, "destino", "init_db")
             initialize(destination)
-            return 0
-        sources = []
-        for name in names:
-            LOG.info("Conectando %s=%s:%d usuario=%s base=%s", name, options[name]["host"],
-                     options[name]["port"], options[name]["username"], options[name]["database"])
-            client = factory(**options[name])
-            stack.callback(client.close)
-            if not hasattr(client, "query_row_block_stream"):
-                raise RuntimeError("clickhouse_connect instalado no soporta query_row_block_stream")
-            sources.append((name, client))
-        failed = []
-        for case in cases:
-            try:
-                load_case(destination, sources, config, case, data_date, public_ip)
-            except Exception as exc:
-                # No imprimir excepciones del driver: pueden incluir URL o datos sensibles.
-                LOG.error("Fallo caso=%s fecha=%s error=%s; no se confirma publicacion. "
-                          "Revisar query_log del servidor y repetir el caso.",
-                          case, data_date, type(exc).__name__)
-                failed.append(case)
-        LOG.info("Fin fecha=%s casos_correctos=%d casos_fallidos=%s", data_date,
-                 len(cases) - len(failed), ",".join(failed) or "ninguno")
-        return 1 if failed else 0
+        return 0
+
+    results = [False] * len(cases)
+
+    def execute(index, case):
+        results[index] = execute_case(config, case, data_date, public_ip, factory, options)
+
+    LOG.info("Ejecucion paralela fecha=%s casos=%d nodos_por_caso=secuenciales",
+             data_date, len(cases))
+    threads = []
+    try:
+        for index, case in enumerate(cases):
+            # Un hilo fijo por caso seleccionado, sin pool ni paralelismo adicional por nodo.
+            thread = threading.Thread(target=execute, args=(index, case), name="cgnat-" + case)
+            thread.start()
+            threads.append(thread)
+    finally:
+        # Mantener el proceso y su bloqueo hasta que terminen todos los casos iniciados.
+        for thread in threads:
+            thread.join()
+    failed = [case for index, case in enumerate(cases) if not results[index]]
+    LOG.info("Fin fecha=%s casos_correctos=%d casos_fallidos=%s", data_date,
+             len(cases) - len(failed), ",".join(failed) or "ninguno")
+    return 1 if failed else 0
 
 
 def main(argv=None):

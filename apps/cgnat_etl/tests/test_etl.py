@@ -1,8 +1,10 @@
 import copy
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import os
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, mock_open, patch
@@ -210,6 +212,116 @@ class EtlTests(unittest.TestCase):
                 with etl.process_lock():
                     raise RuntimeError("Fallo durante la carga")
             self.assertEqual(flock.call_args[0][1], module.LOCK_UN)
+
+
+class ParallelCaseTests(unittest.TestCase):
+    def simulate(self, cases, failed_read=None, failed_connection=None):
+        config = etl.load_config(etl.ROOT / "config.example.ini")
+        for name in ("destino", "origen_1", "origen_2", "origen_3", "origen_4"):
+            config[name]["username"] = "test_user"
+            config[name]["password"] = "test_only"
+        hosts = [config["origen_" + str(i)]["host"] for i in range(1, 5)]
+        # Todos deben estar consultando su primer nodo antes de permitir avances.
+        # Un bucle secuencial o una concurrencia menor que len(cases) falla aqui.
+        barrier = threading.Barrier(len(cases), timeout=5) if not failed_connection else None
+        rows = {
+            "pool_ips": (IP, 5, 9, 2),
+            "pool_ips_privadas": ("10.0.0.1", 9, 3, 2, 100),
+            "carga_nat_hora": (1785542400, IP, 9, 2),
+            "abuso_smtp": ("10.0.0.1", IP, "8.8.8.8", 9, 100),
+            "puertos_mas_usados": (IP, 443, 9, 100, 2),
+        }
+        clients, destinations = [], {}
+        visits = {case: [] for case in cases}
+        test = self
+
+        class OwnedClient:
+            def __init__(self, case, host):
+                self.case, self.host = case, host
+                self.owner = threading.get_ident()
+                self.closed = False
+
+            def check_owner(self):
+                test.assertEqual(threading.get_ident(), self.owner)
+
+            def close(self):
+                self.check_owner()
+                self.closed = True
+
+        class ConcurrentDestination(OwnedClient, Destination):
+            def __init__(self, case, host):
+                OwnedClient.__init__(self, case, host)
+                Destination.__init__(self)
+
+            def command(self, command):
+                self.check_owner()
+                if command.startswith("ALTER TABLE"):
+                    test.assertEqual(visits[self.case], hosts)
+                return Destination.command(self, command)
+
+            def insert(self, *args, **kwargs):
+                self.check_owner()
+                return Destination.insert(self, *args, **kwargs)
+
+            def query(self, query):
+                self.check_owner()
+                return Destination.query(self, query)
+
+        class ConcurrentSource(OwnedClient):
+            @contextmanager
+            def query_row_block_stream(self, query, **kwargs):
+                self.check_owner()
+                visits[self.case].append(self.host)
+                if barrier and self.host == hosts[0]:
+                    barrier.wait()
+                if self.case == failed_read and self.host == hosts[-1]:
+                    raise RuntimeError("Fallo de lectura simulado")
+                yield [[rows[self.case]]]
+
+        def factory(**options):
+            case = threading.current_thread().name[len("cgnat-"):]
+            if case == failed_connection and options["host"] == hosts[2]:
+                raise RuntimeError("Fallo de conexion simulado")
+            if options["host"] == config["destino"]["host"]:
+                client = ConcurrentDestination(case, options["host"])
+                destinations[case] = client
+            else:
+                client = ConcurrentSource(case, options["host"])
+            clients.append(client)
+            return client
+
+        with self.assertLogs("cgnat_etl", level="INFO"):
+            status = etl.run(config, cases, DAY, IP, factory)
+        self.assertTrue(all(client.closed for client in clients))
+        self.assertEqual(len(destinations), len(cases))
+        self.assertFalse(any(t.name.startswith("cgnat-") for t in threading.enumerate()))
+        for case in cases:
+            published = any("REPLACE PARTITION" in cmd for cmd in destinations[case].commands)
+            self.assertEqual(published, case not in (failed_read, failed_connection))
+            if published:
+                self.assertEqual(visits[case], hosts)
+                self.assertEqual(sum(len(b[1]) for b in destinations[case].batches), 4)
+        return status, clients
+
+    def test_five_cases_overlap_with_independent_clients_and_sequential_nodes(self):
+        status, clients = self.simulate(list(etl.CASES))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(clients), 25)
+        self.assertEqual(len({client.owner for client in clients}), 5)
+
+    def test_read_failure_preserves_other_case_publications(self):
+        status, _ = self.simulate(list(etl.CASES), failed_read="pool_ips")
+        self.assertEqual(status, 1)
+
+    def test_connection_failure_closes_open_clients_and_other_cases_complete(self):
+        status, clients = self.simulate(list(etl.CASES), failed_connection="abuso_smtp")
+        self.assertEqual(status, 1)
+        self.assertEqual(len(clients), 23)
+
+    def test_single_selected_case_opens_only_its_own_connections(self):
+        status, clients = self.simulate(["pool_ips_privadas"])
+        self.assertEqual(status, 0)
+        self.assertEqual(len(clients), 5)
 
 
 if __name__ == "__main__":
