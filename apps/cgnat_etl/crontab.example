@@ -1,0 +1,3 @@
+# Todos los dias a las 06:00. Configurar el servicio cron en America/Lima.
+# Consulta automaticamente la tabla del dia anterior.
+0 6 * * * /bin/sh /index1/tareas/proyectos_python/apps/run_cgnat_etl.sh
