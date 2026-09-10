@@ -161,6 +161,26 @@ class EtlTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 etl.connection_options(self.config, "destino")
 
+    def test_password_direct_in_config_does_not_require_environment(self):
+        self.config["destino"]["password"] = "local-secret"
+        with patch.dict(os.environ, {}, clear=True):
+            options = etl.connection_options(self.config, "destino")
+        self.assertEqual(options["password"], "local-secret")
+        self.assertEqual(options["database"], "ookla")
+
+    def test_destination_connection_log_identifies_endpoint_without_password(self):
+        self.config["destino"]["password"] = "local-secret"
+        factory = Mock()
+        client = Mock()
+        factory.return_value = client
+        with patch.object(etl, "initialize"):
+            with self.assertLogs("cgnat_etl", level="INFO") as log_output:
+                with patch.dict(os.environ, {}, clear=True):
+                    self.assertEqual(etl.run(self.config, [], DAY, IP, factory, init_db=True), 0)
+        messages = "\n".join(log_output.output)
+        self.assertIn("destino=172.19.242.107:8123 usuario=nifi base=ookla", messages)
+        self.assertNotIn("local-secret", messages)
+
     def test_initialization_has_five_tables_and_database(self):
         destination = Destination()
         etl.initialize(destination)

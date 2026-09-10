@@ -51,12 +51,30 @@ Los orígenes configurados son **10.96.167.132**, **10.96.167.133**,
 servidor; para HTTPS configurar puerto correspondiente y `secure=true`.
 El puerto nativo 9000 no sirve para este driver.
 
-Editar `conf/cgnat_etl.env` con las contraseñas. `password_env` indica el nombre
-de la variable, no la contraseña. Si cada nodo tiene credenciales distintas,
-asignar variables diferentes en sus secciones y declararlas en el archivo env.
-Una contraseña vacía se declara explícitamente como `VARIABLE=''`.
-No copiar contraseñas al repositorio. El archivo env se interpreta como shell:
-usar comillas adecuadas, especialmente si una contraseña contiene comilla simple.
+Para cada sección puede elegirse una de estas opciones de contraseña:
+
+```ini
+# Opcion 1: la clave en config.ini local.
+password = clave_real
+
+# Opcion 2: la clave en el archivo env local.
+password_env = CGNAT_DEST_PASSWORD
+```
+
+La primera opción es la más simple si ya administras las credenciales dentro de
+`config.ini`; dicho archivo está ignorado por Git y no se debe subir. La segunda
+mantiene las claves en `conf/cgnat_etl.env`, separado de la configuración. Usar
+solo una opción por sección. `password_env` es el nombre de la variable, no la
+contraseña. Si cada nodo tiene credenciales distintas, asignar variables distintas
+en sus secciones y declararlas en el archivo env. El archivo env se interpreta
+como shell: usar comillas adecuadas, especialmente si una contraseña contiene
+comilla simple.
+
+El ejemplo que compartiste para `172.19.242.107:8123` usa el usuario `nifi` y
+una base inicial `ookla`; la plantilla replica esa conexión con `database = ookla`.
+El proyecto publica las tablas mediante referencias explícitas `elog.tabla`, por
+lo que la base inicial no cambia su destino. El usuario necesita permisos sobre
+`elog` para crear y cargar esas tablas.
 
 Confirmar el entorno ya instalado:
 
@@ -137,7 +155,9 @@ Logs: `/index1/tareas/proyectos_python/logs/cgnat_etl/cgnat_etl_YYYYMMDD.log`.
 Incluyen caso, nodo, filas, duración, fallos y nombre de tabla auxiliar. Aplicar
 la política habitual de retención de logs. Códigos: `0` éxito, `1` fallo de carga,
 `2` configuración/dependencia, `75` ejecución simultánea bloqueada.
-No se imprimen contraseñas ni excepciones completas del driver.
+Antes de conectar, el log muestra host, puerto, usuario y base, pero nunca la
+contraseña. Así una autenticación fallida identifica si fue el destino o un
+origen. No se imprimen claves ni excepciones completas del driver.
 Para diagnosticar un fallo consultar `system.query_log` en el servidor afectado
 y el intervalo horario/nombre de auxiliar del log.
 

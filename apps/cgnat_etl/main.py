@@ -93,9 +93,11 @@ def load_config(path):
     endpoints = []
     for name in ["destino"] + origins:
         section = config[name]
-        for key in ("host", "username", "password_env"):
+        for key in ("host", "username"):
             if not section[key].strip():
                 raise ValueError("Falta {} en {}".format(key, name))
+        if not section.get("password", fallback="").strip() and not section.get("password_env", fallback="").strip():
+            raise ValueError("Falta password o password_env en " + name)
         port = positive_int(section, "port")
         if port > 65535:
             raise ValueError("Puerto fuera de rango en " + name)
@@ -112,13 +114,16 @@ def connection_options(config, name):
     section = config[name]
     if any("CAMBIAR" in section[key] for key in ("host", "username")):
         raise ValueError("Complete host/username en " + name)
-    variable = section["password_env"]
-    if variable not in os.environ or os.environ[variable] == "REEMPLAZAR":
-        raise ValueError("Configure la variable de entorno " + variable)
+    password = section.get("password", fallback="")
+    variable = section.get("password_env", fallback="")
+    if not password:
+        if variable not in os.environ or os.environ[variable] == "REEMPLAZAR":
+            raise ValueError("Configure password o la variable de entorno " + variable)
+        password = os.environ[variable]
     return dict(
         host=section["host"], port=section.getint("port"),
-        username=section["username"], password=os.environ[variable],
-        database="default", secure=section.getboolean("secure"),
+        username=section["username"], password=password,
+        database=section.get("database", fallback="default"), secure=section.getboolean("secure"),
         verify=section.getboolean("verify"),
         connect_timeout=config["proceso"].getint("connect_timeout"),
         send_receive_timeout=config["proceso"].getint("send_receive_timeout"),
@@ -238,6 +243,9 @@ def run(config, cases, data_date, public_ip, factory, init_db=False):
     # Validar todas las credenciales antes de abrir conexiones o escribir.
     options = {name: connection_options(config, name) for name in ["destino"] + names}
     with ExitStack() as stack:
+        LOG.info("Conectando destino=%s:%d usuario=%s base=%s", options["destino"]["host"],
+                 options["destino"]["port"], options["destino"]["username"],
+                 options["destino"]["database"])
         destination = factory(**options["destino"])
         stack.callback(destination.close)
         if init_db:
@@ -245,6 +253,8 @@ def run(config, cases, data_date, public_ip, factory, init_db=False):
             return 0
         sources = []
         for name in names:
+            LOG.info("Conectando %s=%s:%d usuario=%s base=%s", name, options[name]["host"],
+                     options[name]["port"], options[name]["username"], options[name]["database"])
             client = factory(**options[name])
             stack.callback(client.close)
             if not hasattr(client, "query_row_block_stream"):
