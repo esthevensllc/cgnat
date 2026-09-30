@@ -9,7 +9,7 @@ de ClickHouse 23 y su esquema se deben comprobar en el servidor.
 ## Artefactos y comprobacion
 
 Los binarios entregados en `dist/linux-arm64/` son estaticos y no requieren Go
-en el servidor para ejecutarse. Copiarlos junto al archivo `.sha256` y verificar:
+en el servidor para ejecutarse. Copiarlos junto al archivo `SHA256SUMS` y verificar:
 
 ```bash
 uname -m
