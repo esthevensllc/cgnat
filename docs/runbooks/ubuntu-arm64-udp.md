@@ -22,6 +22,7 @@ systemctl stop huawei-cgn-go-test
 cd /root/cgnat-arm64-install
 tar -xzf /tmp/cgnat-ubuntu-arm64-install.tar.gz -C .
 sha256sum -c SHA256SUMS
+chmod +x huawei-cgn-go.test udp-simulator
 install -o root -g root -m 0755 huawei-cgn-go /opt/huawei-cgn-go/bin/huawei-cgn-go
 sed -i '/^PARSE_ONLY=/d' /etc/huawei-cgn-go/huawei-cgn-go-test.env
 printf '\nPARSE_ONLY=true\n' >> /etc/huawei-cgn-go/huawei-cgn-go-test.env
