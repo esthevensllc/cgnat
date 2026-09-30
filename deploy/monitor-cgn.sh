@@ -29,7 +29,7 @@ awk '
 }' /proc/net/snmp
 echo
 
-METRICS="$(journalctl -u "$SERVICE" -b --no-pager 2>/dev/null | grep 'metrics live_batch_mode' | tail -1)"
+METRICS="$(journalctl -u "$SERVICE" -b --no-pager 2>/dev/null | grep -E 'metrics (parse_only=[^ ]+ )?live_batch_mode=' | tail -1)"
 
 echo "=== COLLECTOR ==="
 printf '%s\n' "$METRICS" | awk '

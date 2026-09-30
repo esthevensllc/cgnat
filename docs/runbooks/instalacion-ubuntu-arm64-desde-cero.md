@@ -286,6 +286,16 @@ sudo install -o root -g root -m 0755 monitor-cgn.sh /usr/local/bin/monitor-cgn.s
   /index2/huawei-cgn-go/failed /index2/huawei-cgn-go/alerts
 ```
 
+Para la prueba de recepcion y parseo sin ClickHouse (`PARSE_ONLY=true`),
+observar los 16 sockets y las metricas del servicio de prueba en vivo:
+
+```bash
+watch -n 2 '/usr/local/bin/monitor-cgn.sh 9088 huawei-cgn-go-test /index2/huawei-cgn-go-test/failed /index2/huawei-cgn-go-test/alerts'
+```
+
+En este modo es normal que `total_inserted=0`, `workers_insert=0` y que
+`FAILED_DIR` no exista. Salir de `watch` con `Ctrl+C`.
+
 Mantener alertas deshabilitadas durante la primera validacion. Despues pueden
 habilitarse primero en `ALERTS_MODE=observe`; para escritura en ClickHouse,
 configurar `ALERTS_MODE=clickhouse`, permisos y tabla de alertas segun el
