@@ -3,8 +3,9 @@
 Aplicable al servidor Huawei Kunpeng 920 (`aarch64`, Ubuntu, kernel
 `6.8.0-100-generic`). Esta guia instala el collector y un servicio de prueba
 desde binarios ARM64 ya compilados. No instala Go ni ClickHouse. Se asume que
-ClickHouse 23 existe en otro servidor y que el volumen `/index2` esta
-preparado. Sustituir `IP_SERVIDOR`, `IP_CLICKHOUSE`, usuario y contrasena por
+ClickHouse 23 existe en otro servidor y que el directorio `/index2` esta
+preparado. Puede estar en el disco raiz durante la prueba. Sustituir
+`IP_SERVIDOR`, `IP_CLICKHOUSE`, usuario y contrasena por
 valores reales. El portal CGNAT es un componente distinto.
 
 El paquete `dist/cgnat-ubuntu-arm64-install.tar.gz`, incluido en el repositorio,
@@ -54,17 +55,20 @@ dos sockets `SO_REUSEPORT`.
 ## 2. Verificar almacenamiento, hora y ClickHouse
 
 ```bash
-findmnt /index2
+findmnt -T /index2
 df -h /index2
+df -i /index2
 free -h
 timedatectl status
 curl -fsS --max-time 5 http://IP_CLICKHOUSE:8123/ping
 ```
 
-`/index2` debe ser el volumen previsto para los lotes fallidos y el estado de
-alertas. Si `findmnt /index2` no muestra el montaje esperado, preparar el
-volumen antes de continuar: crear solamente el directorio podria llenar el
-disco raiz. Si se decide usar otra ruta, modificar `FAILED_SPOOL_BASE`,
+`/index2` guarda los lotes fallidos y el estado de alertas. Si es un directorio
+del disco raiz, `findmnt -T /index2` mostrara `/` como punto de montaje; esto
+permite la prueba inicial. Antes de activar produccion, dimensionar el espacio
+para una caida de ClickHouse y vigilar `df -h /index2`, porque el spool puede
+llenar el disco raiz. Un volumen separado reduce ese impacto, pero no es
+requisito del collector. Si se decide usar otra ruta, modificar `FAILED_SPOOL_BASE`,
 `ALERT_STATE_DIR`, `ExecStartPre` y `ReadWritePaths` en **ambas** unidades.
 
 El endpoint `/ping` debe responder `Ok.`. En el servidor ClickHouse, un
