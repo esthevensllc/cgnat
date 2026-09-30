@@ -126,6 +126,7 @@ buffer, el collector registra `udp_set_read_buffer_warning`.
 Desde `~/cgnat-arm64-install`:
 
 ```bash
+cd ~/cgnat-arm64-install
 sudo install -o root -g root -m 0755 huawei-cgn-go /opt/huawei-cgn-go/bin/huawei-cgn-go
 sudo install -o root -g huawei-cgn -m 0640 huawei-cgn-go.example /etc/huawei-cgn-go/huawei-cgn-go.env
 sudo install -o root -g huawei-cgn -m 0640 huawei-cgn-go.example /etc/huawei-cgn-go/huawei-cgn-go-test.env
@@ -173,6 +174,9 @@ contiene la contrasena.
 ## 6. Instalar servicios systemd
 
 ```bash
+cd ~/cgnat-arm64-install
+ls -l huawei-cgn-go.service huawei-cgn-go-test.service
+ls -l /opt/huawei-cgn-go/bin/huawei-cgn-go /etc/huawei-cgn-go/huawei-cgn-go-test.env
 sudo install -o root -g root -m 0644 huawei-cgn-go.service /etc/systemd/system/huawei-cgn-go.service
 sudo install -o root -g root -m 0644 huawei-cgn-go-test.service /etc/systemd/system/huawei-cgn-go-test.service
 sudo systemd-analyze verify /etc/systemd/system/huawei-cgn-go.service /etc/systemd/system/huawei-cgn-go-test.service
@@ -196,6 +200,7 @@ Si `ufw` esta activo, permitir temporalmente `19088/udp` solo desde la IP del
 simulador y retirar esa regla al terminar la prueba.
 
 ```bash
+cd ~/cgnat-arm64-install
 ./udp-simulator -target 127.0.0.1:19088 -mode legacy -pps 10000 -duration 2m -workers 8 \
   2>&1 | tee simulator-10k.log
 sudo journalctl -u huawei-cgn-go-test -b --since '-5 min' --no-pager -l \
@@ -243,6 +248,7 @@ sudo ufw allow from IP_ROUTER to any port 9088 proto udp
 Instalar el monitor incluido si se desea:
 
 ```bash
+cd ~/cgnat-arm64-install
 sudo install -o root -g root -m 0755 monitor-cgn.sh /usr/local/bin/monitor-cgn.sh
 /usr/local/bin/monitor-cgn.sh 9088 huawei-cgn-go \
   /index2/huawei-cgn-go/failed /index2/huawei-cgn-go/alerts
