@@ -7,7 +7,7 @@ ClickHouse 23 existe en otro servidor y que el volumen `/index2` esta
 preparado. Sustituir `IP_SERVIDOR`, `IP_CLICKHOUSE`, usuario y contrasena por
 valores reales. El portal CGNAT es un componente distinto.
 
-El paquete `dist/cgnat-ubuntu-arm64-install.zip`, incluido en el repositorio,
+El paquete `dist/cgnat-ubuntu-arm64-install.tar.gz`, incluido en el repositorio,
 contiene los binarios,
 `SHA256SUMS`, la plantilla de configuracion, dos unidades systemd, el monitor
 y esta guia. Los binarios proceden del commit `93213eb` o posterior; revisar
@@ -18,7 +18,7 @@ el commit indicado al recibir un paquete actualizado.
 Desde PowerShell en la raiz del repositorio local:
 
 ```powershell
-scp .\dist\cgnat-ubuntu-arm64-install.zip usuario@IP_SERVIDOR:/tmp/
+scp .\dist\cgnat-ubuntu-arm64-install.tar.gz usuario@IP_SERVIDOR:/tmp/
 ```
 
 En Ubuntu, con una cuenta que tenga `sudo`:
@@ -26,15 +26,24 @@ En Ubuntu, con una cuenta que tenga `sudo`:
 ```bash
 uname -m
 uname -r
-sudo apt update
-sudo apt install -y unzip file iproute2 curl procps
 mkdir -p ~/cgnat-arm64-install
-unzip /tmp/cgnat-ubuntu-arm64-install.zip -d ~/cgnat-arm64-install
+tar -xzf /tmp/cgnat-ubuntu-arm64-install.tar.gz -C ~/cgnat-arm64-install
 cd ~/cgnat-arm64-install
 sha256sum -c SHA256SUMS
 file huawei-cgn-go udp-simulator huawei-cgn-go.test
 chmod +x huawei-cgn-go.test udp-simulator
 ./huawei-cgn-go.test -test.v
+```
+
+No ejecutar `apt update` ni `apt install` en este servidor offline. `tar`,
+`sha256sum` y `systemd` forman parte de la instalacion base habitual de Ubuntu;
+`file`, `iproute2`, `curl` y `procps` ya estaban instalados en este servidor.
+Si ya se copio el ZIP anterior, se puede extraer sin `unzip` cuando exista
+`python3`:
+
+```bash
+mkdir -p ~/cgnat-arm64-install
+python3 -m zipfile -e /tmp/cgnat-ubuntu-arm64-install.zip ~/cgnat-arm64-install
 ```
 
 `uname -m` debe devolver `aarch64`; `sha256sum` debe mostrar tres `OK`; la

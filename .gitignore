@@ -9,6 +9,7 @@
 /bin/
 /dist/*
 !/dist/cgnat-ubuntu-arm64-install.zip
+!/dist/cgnat-ubuntu-arm64-install.tar.gz
 
 # Datos generados por el collector
 *.done

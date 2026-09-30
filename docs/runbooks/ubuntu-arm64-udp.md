@@ -8,12 +8,12 @@ de ClickHouse 23 y su esquema se deben comprobar en el servidor.
 
 ## Artefactos y comprobacion
 
-Los binarios estaticos estan en `dist/cgnat-ubuntu-arm64-install.zip`,
-incluido en el repositorio. Extraer el paquete en el servidor y verificar:
+Los binarios estaticos estan en `dist/cgnat-ubuntu-arm64-install.tar.gz`,
+incluido en el repositorio. Se extrae con `tar` sin instalar paquetes:
 
 ```bash
 mkdir -p ~/cgnat-arm64-install
-unzip cgnat-ubuntu-arm64-install.zip -d ~/cgnat-arm64-install
+tar -xzf /tmp/cgnat-ubuntu-arm64-install.tar.gz -C ~/cgnat-arm64-install
 cd ~/cgnat-arm64-install
 uname -m
 uname -r
