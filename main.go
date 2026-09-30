@@ -39,6 +39,13 @@ const (
 
 var peruTZ = time.FixedZone("PET", -5*60*60)
 
+func spoolModeLabel() string {
+	if parseOnly {
+		return "disabled"
+	}
+	return "failed_inserts_only"
+}
+
 // RawPacketLog conserva el formato RAW actual para que siga siendo compatible
 // con reprocess_raw.go. No se almacenan los JSON parseados de NAT en disco.
 type RawPacketLog struct {
@@ -116,6 +123,7 @@ var (
 	clickhousePass  string
 	clickhouseTable string
 	dailyTables     bool
+	parseOnly       bool
 
 	rawSpoolBase    string
 	failedSpoolBase string
@@ -1115,32 +1123,36 @@ func packetWorker(
 				if alertCohorts != nil {
 					alertCohorts.recordParseResult(cohortSecond, udpReceivers+workerID, true, uint64(len(entries)))
 				}
-				for _, entry := range entries {
-					tableName := dailyTableName(clickhouseTable, entry.EventTime)
-					batch := pending[tableName]
-					if batch == nil {
-						batch = newPendingBatch()
-						pending[tableName] = batch
-					}
+				if parseOnly {
+					atomic.AddUint64(&totalParsed, uint64(len(entries)))
+				} else {
+					for _, entry := range entries {
+						tableName := dailyTableName(clickhouseTable, entry.EventTime)
+						batch := pending[tableName]
+						if batch == nil {
+							batch = newPendingBatch()
+							pending[tableName] = batch
+						}
 
-					beforeLen := len(batch.body)
-					var err error
-					batch.body, err = appendRowBinaryEvent(batch.body, entry)
-					if err != nil {
-						batch.body = batch.body[:beforeLen]
-						atomic.AddUint64(&totalEventMarshalError, 1)
-						log.Printf("event_rowbinary_error worker=%d router_ip=%d end_time=%d error=%v", workerID, entry.RouterIP, entry.EndTime, err)
-						continue
-					}
+						beforeLen := len(batch.body)
+						var err error
+						batch.body, err = appendRowBinaryEvent(batch.body, entry)
+						if err != nil {
+							batch.body = batch.body[:beforeLen]
+							atomic.AddUint64(&totalEventMarshalError, 1)
+							log.Printf("event_rowbinary_error worker=%d router_ip=%d end_time=%d error=%v", workerID, entry.RouterIP, entry.EndTime, err)
+							continue
+						}
 
-					batch.rows++
-					if alertCohorts != nil {
-						batch.cohorts = addInsertCohort(batch.cohorts, cohortSecond, 1)
-					}
-					atomic.AddUint64(&totalParsed, 1)
+						batch.rows++
+						if alertCohorts != nil {
+							batch.cohorts = addInsertCohort(batch.cohorts, cohortSecond, 1)
+						}
+						atomic.AddUint64(&totalParsed, 1)
 
-					if batch.rows >= insertBatchRows || len(batch.body) >= insertBatchBytes {
-						flushTable(tableName, batch)
+						if batch.rows >= insertBatchRows || len(batch.body) >= insertBatchBytes {
+							flushTable(tableName, batch)
+						}
 					}
 				}
 			}
@@ -1462,7 +1474,9 @@ func metricsLogger(
 			}
 
 			log.Printf(
-				"metrics live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only total_received=%d total_udp_kernel_drops=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d alerts_enabled=%t alerts_mode=%s alerts_active=%d total_alerts_opened=%d total_alerts_cleared=%d total_alerts_delivered=%d total_alert_delivery_errors=%d alert_outbox_pending=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d pps_received_10s=%d pps_packet_processed_10s=%d rps_parsed_10s=%d rps_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d udp_read_batches_10s=%d udp_average_batch_10s=%.2f udp_full_batch_pct_10s=%.2f udp_read_errors_10s=%d udp_kernel_drops_10s=%d udp_receiver_min_10s=%d udp_receiver_max_10s=%d udp_receiver_packets_10s=%s",
+				"metrics parse_only=%t live_batch_mode=packet_worker_direct raw_spool_mode=%s total_received=%d total_udp_kernel_drops=%d total_packet_processed=%d total_parsed=%d total_inserted=%d total_packet_queue_drops=%d total_live_insert_skipped=%d total_live_insert_skipped_rows=%d total_parse_errors=%d total_event_marshal_errors=%d total_insert_errors=%d total_insert_dropped_rows=%d total_batches_inserted=%d total_failed_batch_spooled=%d total_failed_rows_spooled=%d total_failed_spool_errors=%d total_tables_created=%d total_table_create_errors=%d alerts_enabled=%t alerts_mode=%s alerts_active=%d total_alerts_opened=%d total_alerts_cleared=%d total_alerts_delivered=%d total_alert_delivery_errors=%d alert_outbox_pending=%d rate_received_10s=%d rate_packet_processed_10s=%d rate_parsed_10s=%d rate_inserted_10s=%d pps_received_10s=%d pps_packet_processed_10s=%d rps_parsed_10s=%d rps_inserted_10s=%d queue_packet=%d/%d queue_batch=%d/%d workers_packet=%d workers_batch=%d workers_insert=%d udp_read_batches_10s=%d udp_average_batch_10s=%.2f udp_full_batch_pct_10s=%.2f udp_read_errors_10s=%d udp_kernel_drops_10s=%d udp_receiver_min_10s=%d udp_receiver_max_10s=%d udp_receiver_packets_10s=%s",
+				parseOnly,
+				spoolModeLabel(),
 				received,
 				atomic.LoadUint64(&totalUDPKernelDrops),
 				processed,
@@ -1590,6 +1604,7 @@ func loadConfig() {
 	clickhousePass = getEnv("CLICKHOUSE_PASS", "")
 	clickhouseTable = getEnv("CLICKHOUSE_TABLE", "cgnat.huawei_cgn_nat_v2")
 	dailyTables = getEnvBool("CLICKHOUSE_DAILY_TABLES", true)
+	parseOnly = getEnvBool("PARSE_ONLY", false)
 
 	rawSpoolBase = getEnv("RAW_SPOOL_BASE", "/index2/huawei-cgn-go/raw")
 	failedSpoolBase = getEnv("FAILED_SPOOL_BASE", filepath.Join(rawSpoolBase, "failed"))
@@ -1678,6 +1693,9 @@ func loadConfig() {
 }
 
 func validateConfig() {
+	if parseOnly && alertConfig.Enabled {
+		log.Fatal("PARSE_ONLY requires ALERTS_ENABLED=false")
+	}
 	positiveValues := map[string]int{
 		"MAX_EVENTS_PER_FILE":          maxPacketsPerFile,
 		"MIN_EVENTS_PER_FILE":          minPacketsPerFile,
@@ -1873,8 +1891,10 @@ func main() {
 	loadConfig()
 	validateConfig()
 
-	if err := ensureFailedSpoolDirs(failedSpoolBase); err != nil {
-		log.Fatalf("failed_spool_directory_error error=%v", err)
+	if !parseOnly {
+		if err := ensureFailedSpoolDirs(failedSpoolBase); err != nil {
+			log.Fatalf("failed_spool_directory_error error=%v", err)
+		}
 	}
 
 	var alerts *alertManager
@@ -1999,7 +2019,9 @@ func main() {
 	}
 
 	spawnPacketWorkers(packetWorkers)
-	spawnInsertWorkers(insertWorkers)
+	if !parseOnly {
+		spawnInsertWorkers(insertWorkers)
+	}
 
 	for receiverIndex, receiver := range receivers {
 		readWG.Add(1)
@@ -2019,12 +2041,14 @@ func main() {
 	)
 
 	log.Printf(
-		"collector_started listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=failed_inserts_only failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_reuseport_hash_offsets=%s udp_batch_size=%d udp_rxq_overflow_metrics=true packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d alerts_enabled=%t alerts_mode=%s alert_window_seconds=%d alert_sla_seconds=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
+		"collector_started parse_only=%t listen_addr=%s clickhouse_url=%s clickhouse_table_base=%s clickhouse_daily_tables=%t clickhouse_daily_pattern=%s_YYYY_MM_DD clickhouse_insert_format=RowBinary live_batch_mode=packet_worker_direct raw_spool_mode=%s failed_spool=%s udp_receive_mode=%s udp_receivers=%d udp_reuse_port=%t udp_reuseport_hash_offsets=%s udp_batch_size=%d udp_rxq_overflow_metrics=true packet_workers=%d packet_channel_size=%d batch_builders_ignored=%d insert_workers=%d insert_batch_rows=%d insert_batch_bytes=%d insert_flush_ms=%d udp_read_buffer_mb=%d auto_tune=%t auto_tune_max_packet_workers=%d auto_tune_max_batch_builders_ignored=%d auto_tune_max_insert_workers=%d live_insert_overload_policy=%s live_insert_queue_high_watermark_pct=%d alerts_enabled=%t alerts_mode=%s alert_window_seconds=%d alert_sla_seconds=%d parsed_json_spool=false accept_any_header=true dynamic_multi_record=true start_end_time=true raw_first_pipeline=false direct_live_batching=true graceful_shutdown=true",
+		parseOnly,
 		listenAddr,
 		clickhouseURL,
 		clickhouseTable,
 		dailyTables,
 		clickhouseTable,
+		spoolModeLabel(),
 		failedSpoolBase,
 		udpReceiveMode,
 		udpReceivers,
@@ -2034,7 +2058,7 @@ func main() {
 		packetWorkers,
 		packetChannelSize,
 		batchBuilders,
-		insertWorkers,
+		atomic.LoadInt64(&currentInsertWorkers),
 		insertBatchRows,
 		insertBatchBytes,
 		insertFlushMS,

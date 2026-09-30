@@ -6,6 +6,9 @@ Para un servidor Ubuntu ARM64 sin instalacion previa, empezar por la
 El paquete ARM64 recomendado para un servidor offline esta en
 [`dist/cgnat-ubuntu-arm64-install.tar.gz`](dist/cgnat-ubuntu-arm64-install.tar.gz);
 se extrae con `tar`, sin instalar paquetes.
+Para medir recepcion y parseo antes de tener ClickHouse, configurar
+`PARSE_ONLY=true` solo en el servicio de prueba; ver
+[prueba ARM64 sin ClickHouse](docs/runbooks/ubuntu-arm64-udp.md#recepcion-y-parseo-sin-clickhouse).
 
 Collector UDP en Go para recibir eventos Huawei CGN NAT por `9088/udp`,
 parsearlos e insertarlos en tablas diarias de ClickHouse mediante `RowBinary`.

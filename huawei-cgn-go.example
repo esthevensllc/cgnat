@@ -5,6 +5,8 @@ CLICKHOUSE_USER=REEMPLAZAR_USUARIO
 CLICKHOUSE_PASS=REEMPLAZAR_CONTRASENA
 CLICKHOUSE_TABLE=cgnat.huawei_cgn_nat_v2
 CLICKHOUSE_DAILY_TABLES=true
+# Solo para pruebas sin ClickHouse: recibe y parsea, sin insertar ni guardar lotes fallidos.
+PARSE_ONLY=false
 
 RAW_SPOOL_BASE=/index2/huawei-cgn-go/raw
 FAILED_SPOOL_BASE=/index2/huawei-cgn-go/failed

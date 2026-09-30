@@ -2,8 +2,8 @@
 
 Aplicable al servidor Huawei Kunpeng 920 (`aarch64`, Ubuntu, kernel
 `6.8.0-100-generic`). Esta guia instala el collector y un servicio de prueba
-desde binarios ARM64 ya compilados. No instala Go ni ClickHouse. Se asume que
-ClickHouse 23 existe en otro servidor y que el directorio `/index2` esta
+desde binarios ARM64 ya compilados. No instala Go ni ClickHouse. ClickHouse
+puede incorporarse despues de las pruebas UDP. El directorio `/index2` esta
 preparado. Puede estar en el disco raiz durante la prueba. Sustituir
 `IP_SERVIDOR`, `IP_CLICKHOUSE`, usuario y contrasena por
 valores reales. El portal CGNAT es un componente distinto.
@@ -13,6 +13,12 @@ contiene los binarios,
 `SHA256SUMS`, la plantilla de configuracion, dos unidades systemd, el monitor
 y esta guia. Los binarios proceden del commit `93213eb` o posterior; revisar
 el commit indicado al recibir un paquete actualizado.
+
+Si aun no hay ClickHouse, se puede probar recepcion y parseo con
+`PARSE_ONLY=true` en el servicio de prueba. Seguir la seccion
+[Recepcion y parseo sin ClickHouse](ubuntu-arm64-udp.md#recepcion-y-parseo-sin-clickhouse).
+En ese caso omitir las comprobaciones y credenciales de ClickHouse hasta la
+puesta en produccion. `PARSE_ONLY=false` conserva el flujo de insercion normal.
 
 ## 1. Copiar el paquete
 
@@ -60,7 +66,6 @@ df -h /index2
 df -i /index2
 free -h
 timedatectl status
-curl -fsS --max-time 5 http://IP_CLICKHOUSE:8123/ping
 ```
 
 `/index2` guarda los lotes fallidos y el estado de alertas. Si es un directorio
@@ -71,7 +76,13 @@ llenar el disco raiz. Un volumen separado reduce ese impacto, pero no es
 requisito del collector. Si se decide usar otra ruta, modificar `FAILED_SPOOL_BASE`,
 `ALERT_STATE_DIR`, `ExecStartPre` y `ReadWritePaths` en **ambas** unidades.
 
-El endpoint `/ping` debe responder `Ok.`. En el servidor ClickHouse, un
+Cuando ClickHouse este disponible, comprobar el endpoint:
+
+```bash
+curl -fsS --max-time 5 http://IP_CLICKHOUSE:8123/ping
+```
+
+Debe responder `Ok.`. En el servidor ClickHouse, un
 administrador debe confirmar `SELECT version()`, crear la base si falta y dar
 al usuario del collector permiso para `CREATE TABLE`, `INSERT` y `SELECT` en
 `cgnat.*`:
@@ -84,6 +95,8 @@ CREATE DATABASE IF NOT EXISTS cgnat;
 El collector crea las tablas NAT diarias al recibir eventos. La version mayor
 23 no basta para confirmar compatibilidad: la primera insercion de prueba
 verificara el DDL y RowBinary contra la version exacta del servidor.
+Estos pasos de ClickHouse se omiten cuando el servicio de prueba usa
+`PARSE_ONLY=true`.
 
 ## 3. Crear usuario y carpetas
 
@@ -134,15 +147,25 @@ sudoedit /etc/huawei-cgn-go/huawei-cgn-go.env
 sudoedit /etc/huawei-cgn-go/huawei-cgn-go-test.env
 ```
 
-En **ambos** archivos reemplazar estos valores de la plantilla:
+En **ambos** archivos definir la IP real del collector y conservar el modo
+optimizado:
+
+```ini
+ALERT_SERVER_IP=IP_SERVIDOR
+UDP_RECEIVE_MODE=reuseport_bpf
+```
+
+Cuando ClickHouse este disponible, completar en ambos archivos:
 
 ```ini
 CLICKHOUSE_URL=http://IP_CLICKHOUSE:8123
 CLICKHOUSE_USER=USUARIO_REAL
 CLICKHOUSE_PASS=CONTRASENA_REAL
-ALERT_SERVER_IP=IP_SERVIDOR
-UDP_RECEIVE_MODE=reuseport_bpf
 ```
+
+Con `PARSE_ONLY=true` en el entorno de prueba, esos tres valores de
+ClickHouse no se utilizan. No iniciar produccion mientras sigan como
+marcadores.
 
 En produccion, dejar `LISTEN_ADDR=0.0.0.0:9088`,
 `CLICKHOUSE_TABLE=cgnat.huawei_cgn_nat_v2`, las rutas `/index2/huawei-cgn-go`
@@ -157,14 +180,16 @@ FAILED_SPOOL_BASE=/index2/huawei-cgn-go-test/failed
 ALERT_STATE_DIR=/index2/huawei-cgn-go-test/alerts
 CLICKHOUSE_ALERT_TABLE=cgnat.collector_alerts_test
 ALERTS_ENABLED=false
+PARSE_ONLY=true
 ```
 
 Mantener `UDP_RECEIVERS=16`, `UDP_BATCH_SIZE=128` y
 `UDP_REUSEPORT_HASH_OFFSETS=20,36` inicialmente. Son valores de partida, no
-una capacidad garantizada. Verificar que no queden marcadores:
+una capacidad garantizada. Antes de activar produccion, verificar que no
+queden marcadores en su archivo:
 
 ```bash
-sudo grep -nE 'REEMPLAZAR|CLICKHOUSE_HOST' /etc/huawei-cgn-go/*.env
+sudo grep -nE 'REEMPLAZAR|CLICKHOUSE_HOST' /etc/huawei-cgn-go/huawei-cgn-go.env
 sudo stat -c '%U:%G %a %n' /etc/huawei-cgn-go/*.env
 ```
 
@@ -201,15 +226,18 @@ simulador y retirar esa regla al terminar la prueba.
 
 ```bash
 cd ~/cgnat-arm64-install
-./udp-simulator -target 127.0.0.1:19088 -mode legacy -pps 10000 -duration 2m -workers 8 \
-  2>&1 | tee simulator-10k.log
+./udp-simulator -target 127.0.0.1:19088 -mode legacy -pps 1000 -duration 30s -workers 4 \
+  2>&1 | tee simulator-1k.log
+sleep 11
 sudo journalctl -u huawei-cgn-go-test -b --since '-5 min' --no-pager -l \
   | grep -E 'metrics |clickhouse_table_ready|insert_error|clickhouse_status|failed'
 ss -u -n -a -p -m 'sport = :19088'
 nstat -az UdpInDatagrams UdpInErrors UdpRcvbufErrors
 ```
 
-En ClickHouse, consultar la tabla de prueba que indiquen los logs (sustituir
+Con `PARSE_ONLY=true` omitir la consulta siguiente: no se crean tablas ni se
+guardan filas. Con ClickHouse y `PARSE_ONLY=false`, consultar la tabla de prueba
+que indiquen los logs (sustituir
 `YYYY_MM_DD` por la fecha real de los eventos):
 
 ```sql
@@ -217,7 +245,9 @@ SELECT count(), min(end_time), max(end_time)
 FROM cgnat.huawei_cgn_nat_v2_test_YYYY_MM_DD;
 ```
 
-`total_received`, `total_parsed` y `total_inserted` deben aumentar. Revisar
+En modo parseo solamente, `total_received` y `total_parsed` deben aumentar;
+`total_inserted` permanece en cero. Con ClickHouse y `PARSE_ONLY=false`, los
+tres deben aumentar. Revisar
 `total_udp_kernel_drops`, `total_packet_queue_drops`, `total_insert_errors`,
 `total_failed_rows_spooled`, `queue_packet` y `queue_batch`. Guardar log del
 simulador, metricas del collector y conteo de ClickHouse para comparar envios,
@@ -226,7 +256,9 @@ recepcion e insercion. El comando de rampa y el analisis de PPS estan en
 
 ## 8. Pasar a produccion
 
-Despues de validar la prueba y el esquema en ClickHouse:
+Despues de disponer de ClickHouse, configurar sus credenciales, cambiar
+`PARSE_ONLY=false` en el entorno de produccion y validar una insercion en la
+tabla de prueba. Entonces activar produccion:
 
 ```bash
 sudo systemctl stop huawei-cgn-go-test

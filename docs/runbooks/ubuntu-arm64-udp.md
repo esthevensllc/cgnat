@@ -6,6 +6,48 @@ receptor Linux comparte codigo entre amd64 y arm64; parseo, RowBinary,
 reintentos y alertas siguen en el flujo comun del collector. La version exacta
 de ClickHouse 23 y su esquema se deben comprobar en el servidor.
 
+## Recepcion y parseo sin ClickHouse
+
+Para validar la ruta UDP y el parser antes de instalar ClickHouse, usar el
+binario actualizado y `PARSE_ONLY=true` solamente en el entorno del servicio
+de prueba. El servicio debe tener `ALERTS_ENABLED=false`. En este modo no se
+crean tablas, no se hacen peticiones HTTP ni se guardan lotes fallidos; por
+diseno `total_inserted=0`. `total_parsed` cuenta registros parseados, mientras
+`total_received` cuenta datagramas UDP. En modo `multi` son unidades distintas.
+
+En un servidor donde el servicio de prueba ya esta instalado:
+
+```bash
+systemctl stop huawei-cgn-go-test
+cd /root/cgnat-arm64-install
+tar -xzf /tmp/cgnat-ubuntu-arm64-install.tar.gz -C .
+sha256sum -c SHA256SUMS
+install -o root -g root -m 0755 huawei-cgn-go /opt/huawei-cgn-go/bin/huawei-cgn-go
+sed -i '/^PARSE_ONLY=/d' /etc/huawei-cgn-go/huawei-cgn-go-test.env
+printf '\nPARSE_ONLY=true\n' >> /etc/huawei-cgn-go/huawei-cgn-go-test.env
+grep -E '^(PARSE_ONLY|ALERTS_ENABLED|LISTEN_ADDR)=' /etc/huawei-cgn-go/huawei-cgn-go-test.env
+systemctl start huawei-cgn-go-test
+journalctl -u huawei-cgn-go-test -b -n 30 --no-pager -l | grep -E 'collector_started|reuseport_bpf_attached|error'
+```
+
+El arranque debe mostrar `parse_only=true` y `reuseport_bpf_attached`.
+Con `LISTEN_ADDR=0.0.0.0:9088`, ejecutar desde el mismo servidor:
+
+```bash
+./udp-simulator -target 127.0.0.1:9088 -mode legacy -pps 1000 -duration 30s -workers 4 \
+  2>&1 | tee simulator-1k.log
+sleep 11
+journalctl -u huawei-cgn-go-test -b --since '-3 min' --no-pager -l | grep 'metrics parse_only=true'
+```
+
+Comparar `sent` con el incremento de `total_received`; revisar
+`total_packet_processed`, `total_parsed`, `total_parse_errors`,
+`total_udp_kernel_drops`, `total_packet_queue_drops` y `queue_packet`.
+`total_inserted`, `total_insert_errors` y `total_failed_rows_spooled` deben
+seguir en cero. Esta prueba en loopback no mide el rendimiento de la NIC ni de
+la red. Para activar inserciones despues, configurar ClickHouse y volver a
+`PARSE_ONLY=false` antes de iniciar produccion.
+
 ## Artefactos y comprobacion
 
 Los binarios estaticos estan en `dist/cgnat-ubuntu-arm64-install.tar.gz`,
