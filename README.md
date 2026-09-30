@@ -1,5 +1,7 @@
 # Huawei CGN NAT Collector
 
+Para Ubuntu ARM64 (Kunpeng 920), ver [despliegue y prueba ARM64](docs/runbooks/ubuntu-arm64-udp.md).
+
 Collector UDP en Go para recibir eventos Huawei CGN NAT por `9088/udp`,
 parsearlos e insertarlos en tablas diarias de ClickHouse mediante `RowBinary`.
 El proceso conserva en disco solamente los lotes que no pudieron insertarse y

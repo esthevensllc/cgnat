@@ -1,4 +1,4 @@
-//go:build !linux || !amd64
+//go:build !linux || (!amd64 && !arm64)
 
 package main
 
@@ -45,7 +45,7 @@ func cloneUDPReceiver(receiver *udpReceiver, batchSize int) *udpReceiver {
 }
 
 func attachReusePortPayloadSelector(receiver *udpReceiver, socketCount int, hashOffsets []int) error {
-	return fmt.Errorf("reuseport_bpf is only supported on linux/amd64")
+	return fmt.Errorf("reuseport_bpf is only supported on linux/amd64 and linux/arm64")
 }
 
 func (receiver *udpReceiver) Close() error {

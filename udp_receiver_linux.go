@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux && (amd64 || arm64)
 
 package main
 
@@ -15,7 +15,6 @@ import (
 )
 
 const (
-	sysRecvmmsg           = 299
 	soReusePort           = 15
 	soAttachReusePortCBPF = 51
 	soRXQOverflow         = 40
@@ -302,7 +301,7 @@ func (receiver *udpReceiver) recvmmsg(fd uintptr, results []UDPReadResult) (int,
 	}
 
 	n, _, errno := syscall.Syscall6(
-		sysRecvmmsg,
+		syscall.SYS_RECVMMSG,
 		fd,
 		uintptr(unsafe.Pointer(&receiver.messages[0])),
 		uintptr(len(results)),
