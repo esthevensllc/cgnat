@@ -7,7 +7,8 @@
 *.test
 *.out
 /bin/
-/dist/
+/dist/*
+!/dist/cgnat-ubuntu-arm64-install.zip
 
 # Datos generados por el collector
 *.done

@@ -3,6 +3,8 @@
 Para Ubuntu ARM64 (Kunpeng 920), ver [despliegue y prueba ARM64](docs/runbooks/ubuntu-arm64-udp.md).
 Para un servidor Ubuntu ARM64 sin instalacion previa, empezar por la
 [guia de instalacion desde cero](docs/runbooks/instalacion-ubuntu-arm64-desde-cero.md).
+El paquete ARM64 que usa esa guia esta en
+[`dist/cgnat-ubuntu-arm64-install.zip`](dist/cgnat-ubuntu-arm64-install.zip).
 
 Collector UDP en Go para recibir eventos Huawei CGN NAT por `9088/udp`,
 parsearlos e insertarlos en tablas diarias de ClickHouse mediante `RowBinary`.

@@ -8,10 +8,13 @@ de ClickHouse 23 y su esquema se deben comprobar en el servidor.
 
 ## Artefactos y comprobacion
 
-Los binarios entregados en `dist/linux-arm64/` son estaticos y no requieren Go
-en el servidor para ejecutarse. Copiarlos junto al archivo `SHA256SUMS` y verificar:
+Los binarios estaticos estan en `dist/cgnat-ubuntu-arm64-install.zip`,
+incluido en el repositorio. Extraer el paquete en el servidor y verificar:
 
 ```bash
+mkdir -p ~/cgnat-arm64-install
+unzip cgnat-ubuntu-arm64-install.zip -d ~/cgnat-arm64-install
+cd ~/cgnat-arm64-install
 uname -m
 uname -r
 sha256sum -c SHA256SUMS

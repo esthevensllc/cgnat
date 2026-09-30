@@ -7,7 +7,8 @@ ClickHouse 23 existe en otro servidor y que el volumen `/index2` esta
 preparado. Sustituir `IP_SERVIDOR`, `IP_CLICKHOUSE`, usuario y contrasena por
 valores reales. El portal CGNAT es un componente distinto.
 
-El paquete `dist/cgnat-ubuntu-arm64-install.zip` contiene los binarios,
+El paquete `dist/cgnat-ubuntu-arm64-install.zip`, incluido en el repositorio,
+contiene los binarios,
 `SHA256SUMS`, la plantilla de configuracion, dos unidades systemd, el monitor
 y esta guia. Los binarios proceden del commit `93213eb` o posterior; revisar
 el commit indicado al recibir un paquete actualizado.
