@@ -51,18 +51,20 @@ Si falta, editar el archivo directamente en el servidor con un editor y
 mantenerlo legible solo para `root` y el grupo que usa el colector. No pegar
 la contraseña en el chat ni en un comando que quede en el historial.
 
-## 3. Crear y comprobar la tabla de eventos
+## 3. Crear y comprobar las tablas de eventos y alertas
 
 Copiar `deploy/create-cgnat-daily-table.sh` a `claro` y ejecutarlo. El script
-lee el nombre real de la tabla del archivo de entorno y toma la fecha actual
-en `America/Lima`:
+lee los nombres reales de las dos tablas del archivo de entorno y toma la
+fecha actual de eventos en `America/Lima`:
 
 ```bash
 bash /root/create-cgnat-daily-table.sh
 ```
 
 Para el 2 de octubre de 2026, crea
-`cgnat.huawei_cgn_nat_test_2026_10_02`. Si se quiere crear una fecha
+`cgnat.huawei_cgn_nat_test_2026_10_02` y `cgnat.collector_alerts_test`.
+La tabla de alertas queda lista aunque `ALERTS_ENABLED=false`; no recibirá
+alertas hasta activar esa función. Si se quiere crear una fecha
 determinada, pasar el archivo de entorno y la fecha:
 
 ```bash
@@ -70,9 +72,14 @@ bash /root/create-cgnat-daily-table.sh \
   /etc/huawei-cgn-go/huawei-cgn-go-test.env 2026_10_02
 ```
 
-El colector crea automáticamente las tablas de los días siguientes al
-recibir el primer lote de cada fecha. `cgnat.collector_alerts_test` no se
-necesita mientras `ALERTS_ENABLED=false`.
+El colector crea automáticamente las tablas de eventos de los días
+siguientes al recibir el primer lote de cada fecha. Comprobar las dos tablas
+sin mostrar las credenciales:
+
+```bash
+clickhouse-client --user=admin --password --query \
+  "SELECT name, engine FROM system.tables WHERE database = 'cgnat' AND name IN ('huawei_cgn_nat_test_2026_10_02', 'collector_alerts_test') ORDER BY name"
+```
 
 ## 4. Iniciar y validar una carga pequeña
 
