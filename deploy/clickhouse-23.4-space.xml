@@ -1,0 +1,15 @@
+<clickhouse>
+    <path>/space/clickhouse/data/</path>
+    <tmp_path>/space/clickhouse/tmp/</tmp_path>
+    <user_files_path>/space/clickhouse/user_files/</user_files_path>
+    <format_schema_path>/space/clickhouse/format_schemas/</format_schema_path>
+    <user_directories>
+        <local_directory>
+            <path>/space/clickhouse/access/</path>
+        </local_directory>
+    </user_directories>
+    <logger>
+        <log>/space/clickhouse/logs/clickhouse-server.log</log>
+        <errorlog>/space/clickhouse/logs/clickhouse-server.err.log</errorlog>
+    </logger>
+</clickhouse>

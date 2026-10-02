@@ -7,6 +7,11 @@
 > paquete no es utilizable aqui. Se esta evaluando una compilacion ARMv8.0
 > compatible; debe probarse antes de instalarla como servicio.
 
+Para la prueba temporal en este mismo equipo se preparo la version estable
+anterior `23.4.6.25`, que ya habia funcionado en `claro`. Seguir
+[su guia offline para `/space`](clickhouse-23.4-kunpeng-offline-space.md).
+La rama 23.4 ya no recibe actualizaciones de seguridad.
+
 Para limpiar el estado parcial de `dpkg` en `claro` (no contiene datos a
 conservar, segun confirmacion del usuario):
 
