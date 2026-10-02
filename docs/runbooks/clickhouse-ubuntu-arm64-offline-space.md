@@ -18,12 +18,12 @@ df -hT /space
 dpkg-query -W 'clickhouse*' 2>/dev/null || true
 ```
 
-Continuar solo si la arquitectura es `aarch64`/`arm64`, `/space` aparece como
-un punto de montaje independiente, tiene aproximadamente 30 T de capacidad y
-no hay otra instalacion de ClickHouse que conservar. No crear `/space` como
-simple directorio sobre `/`: eso podria llenar el disco raiz. Para uso de
-ClickHouse, el filesystem debe soportar permisos y operaciones POSIX (por
-ejemplo XFS o ext4).
+Continuar solo si la arquitectura es `aarch64`/`arm64` y `/space` aparece como
+un punto de montaje independiente de aproximadamente 30 T. En `claro` se
+confirmo `ext4`, 29.9 T de capacidad y una instalacion activa de ClickHouse
+`23.4.6.25` con 384 MB en `/var/lib/clickhouse`. Seguir el paso 2A para
+reemplazar esa instalacion. No crear `/space` como simple directorio sobre
+`/`: eso podria llenar el disco raiz.
 
 ## 2. Transferir y comprobar el paquete
 
@@ -49,6 +49,75 @@ dpkg-deb -f clickhouse-client_26.5.3.52_arm64.deb Package Version Architecture
 Las tres comprobaciones SHA256 deben terminar en `OK`; los DEB deben indicar
 version `26.5.3.52` y arquitectura `arm64`. No ejecutar `apt update` ni
 instalar dependencias desde la red.
+
+## 2A. Respaldar y retirar ClickHouse 23.4 de claro
+
+El usuario confirmo que este servidor no tiene ClickHouse en produccion y
+autorizo reemplazar la instalacion 23.4. Este paso crea una instancia nueva;
+**no migra automaticamente** los datos ni las credenciales viejas. Mantener
+el respaldo para poder inspeccionarlos o recuperarlos despues. Ejecutar todo
+el bloque siguiente en la misma terminal root, despues de verificar el paquete
+del paso 2:
+
+```bash
+umask 077
+backup_dir="/space/clickhouse-backups/pre-26.5-$(date +%Y%m%d-%H%M%S)"
+install -d -m 0700 "$backup_dir"
+dpkg-query -W -f='${Status} ${binary:Package} ${Version}\n' \
+  clickhouse-client clickhouse-common-static clickhouse-server \
+  > "$backup_dir/packages.txt"
+systemctl cat clickhouse-server > "$backup_dir/systemd-unit.txt"
+systemctl stop clickhouse-server
+systemctl is-active clickhouse-server
+```
+
+El ultimo comando debe decir `inactive`. Si indica `active`, detenerse y
+revisar el servicio; no respaldar datos en escritura. Continuar en la misma
+terminal para conservar `backup_dir`:
+
+```bash
+tar -C / -cpf "$backup_dir/etc-clickhouse-server.tar" etc/clickhouse-server
+tar -C / -cpf "$backup_dir/var-lib-clickhouse.tar" var/lib/clickhouse
+if [ -d /var/log/clickhouse-server ]; then
+  tar -C / -cpf "$backup_dir/var-log-clickhouse-server.tar" var/log/clickhouse-server
+fi
+( cd "$backup_dir" && sha256sum ./*.tar > SHA256SUMS && sha256sum -c SHA256SUMS )
+```
+
+Solo continuar si los respaldos terminan sin errores y sus comprobaciones
+dicen `OK`:
+
+```bash
+dpkg --purge clickhouse-client clickhouse-server clickhouse-common-static
+```
+
+Solo continuar si `dpkg --purge` termina sin errores. Guardar los directorios
+que el paquete haya dejado y quitar posibles unidades locales antiguas:
+
+```bash
+if [ -e /etc/clickhouse-server ]; then
+  mv -- /etc/clickhouse-server "$backup_dir/etc-clickhouse-server-leftover"
+fi
+if [ -e /var/lib/clickhouse ]; then
+  mv -- /var/lib/clickhouse "$backup_dir/var-lib-clickhouse-leftover"
+fi
+if [ -e /var/log/clickhouse-server ]; then
+  mv -- /var/log/clickhouse-server "$backup_dir/var-log-clickhouse-server-leftover"
+fi
+if [ -e /etc/systemd/system/clickhouse-server.service.d ]; then
+  mv -- /etc/systemd/system/clickhouse-server.service.d \
+    "$backup_dir/systemd-service-dropins-leftover"
+fi
+if [ -e /etc/systemd/system/clickhouse-server.service ]; then
+  mv -- /etc/systemd/system/clickhouse-server.service \
+    "$backup_dir/systemd-service-override-leftover"
+fi
+systemctl daemon-reload
+printf 'Respaldo: %s\n' "$backup_dir"
+```
+
+Los TAR contienen potencialmente credenciales y consultas: mantener el
+directorio de respaldo con permisos root.
 
 ## 3. Instalar y configurar los directorios
 
