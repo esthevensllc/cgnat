@@ -1,5 +1,27 @@
 # ClickHouse offline en Ubuntu ARM64 con datos en /space
 
+> **Bloqueado en `claro` (Huawei Kunpeng 920).** El DEB ARM64 oficial
+> `26.5.3.52` incluido en este paquete termino con `Illegal instruction`
+> durante el `postinst` de `clickhouse-server` el 2026-10-02. No repetir
+> `dpkg -i`, `dpkg --configure -a` ni los pasos 3 y 4 en este equipo. El
+> paquete no es utilizable aqui. Se esta evaluando una compilacion ARMv8.0
+> compatible; debe probarse antes de instalarla como servicio.
+
+Para limpiar el estado parcial de `dpkg` en `claro` (no contiene datos a
+conservar, segun confirmacion del usuario):
+
+```bash
+dpkg --purge clickhouse-client clickhouse-server clickhouse-common-static
+dpkg --audit
+grep -m1 '^Features' /proc/cpuinfo
+```
+
+`dpkg --audit` debe terminar sin listar paquetes pendientes. El binario
+compatible de diagnostico se prueba con `--version` y `local` antes de
+considerar otra instalacion. No sustituir el binario del DEB 26.5 por uno
+de otra version: la version del ejecutable y la del paquete dejarian de
+coincidir.
+
 Servidor objetivo: `claro`, Ubuntu 24.04 ARM64. Version elegida: ClickHouse
 `26.5.3.52`, igual a la instancia existente consultada durante la preparacion.
 El paquete local `clickhouse-26.5.3.52-arm64-offline.tar.gz` contiene los tres
