@@ -57,3 +57,12 @@ ClickHouse en `/space` todavia se requiere una compilacion compatible de una
 version estable fijada, o una decision explicita de usar otra version. No
 mezclar este binario `master` con los DEB 26.5: la version del ejecutable y
 la registrada por el paquete dejarian de coincidir.
+
+**Resultado en `claro` (2026-10-02):** SHA256 `OK`; `--version` y
+`local --query 'SELECT version()'` terminaron correctamente. El binario
+reporto `26.10.1.1281 (official build)`. Esto confirma que la variante
+`aarch64v80compat` resuelve la incompatibilidad de instrucciones observada
+con el DEB 26.5. No confirma aun un servidor persistente, el almacenamiento
+en `/space`, ni una carga de insercion. Al ser una compilacion de `master`,
+se debe tratar como diagnostica/experimental; la instalacion definitiva
+requiere una compilacion ARMv8.0 compatible de una version estable 26.x.
