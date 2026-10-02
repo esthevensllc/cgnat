@@ -16,6 +16,41 @@ El paquete local contiene los tres DEB oficiales `23.4.6.25` para ARM64,
 
 ## 1. Transferir el paquete
 
+Si los tres DEB `23.4.6.25` ya estan en `/root`, no hace falta transferir
+el archivo grande `.tar.gz`. Usar este procedimiento alternativo y despues
+continuar en el paso 2:
+
+```bash
+cd /root
+sha256sum -c - <<'EOF'
+dc7e1190978baa389de4d9aa48ef8137e09115f30dd30fe3e1524ea4260c5070  clickhouse-client_23.4.6.25_arm64.deb
+236f553d44cbbe8fdceec8f41f2adb1659ecd0396094e29ba97f858158679b9d  clickhouse-common-static_23.4.6.25_arm64.deb
+452d22244cc3d4ae46b5c7c11a2a0658830812b7ea5082eea7c501ba67a5eb90  clickhouse-server_23.4.6.25_arm64.deb
+EOF
+```
+
+Los tres resultados deben ser `OK`; detenerse si alguno difiere. Los DEB
+`26.8.11.7` que tambien estan en `/root` no se usan en esta instalacion.
+Transferir solamente los dos archivos pequenos de configuracion desde
+PowerShell, en la raiz del repositorio:
+
+```powershell
+scp .\deploy\clickhouse-23.4-space.xml root@IP_CLARO:/root/90-space.xml
+scp .\deploy\clickhouse-space.conf root@IP_CLARO:/root/space.conf
+```
+
+En `claro`, reunir los cinco archivos en el directorio que usan los pasos
+siguientes:
+
+```bash
+mkdir -p /root/clickhouse-23.4.6.25-arm64-offline
+mv /root/clickhouse-{client,common-static,server}_23.4.6.25_arm64.deb \
+  /root/90-space.xml /root/space.conf \
+  /root/clickhouse-23.4.6.25-arm64-offline/
+```
+
+Si los DEB no estaban previamente en `/root`, seguir la ruta del tar:
+
 Desde PowerShell, en la raiz del repositorio:
 
 ```powershell
