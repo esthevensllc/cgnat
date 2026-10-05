@@ -71,7 +71,12 @@ printf '%s\n' "$METRICS" | awk '
   keys[31]="total_alerts_delivered"
   keys[32]="total_alert_delivery_errors"
   keys[33]="alert_outbox_pending"
-  for (i=1; i<=33; i++) printf "%-35s %s\n", keys[i], value[keys[i]]
+  keys[34]="total_parse_errors"
+  keys[35]="total_event_marshal_errors"
+  keys[36]="total_insert_dropped_rows"
+  keys[37]="total_table_create_errors"
+  keys[38]="total_live_insert_skipped_rows"
+  for (i=1; i<=38; i++) printf "%-35s %s\n", keys[i], value[keys[i]]
 }'
 echo
 
