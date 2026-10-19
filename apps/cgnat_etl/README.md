@@ -1,7 +1,7 @@
 # ETL CGNAT: cuatro nodos hacia elog
 
 Proyecto para Python **3.7.4**, usando `clickhouse_connect` del entorno existente.
-Ejecuta los **cinco casos en paralelo**; dentro de cada caso consulta los cuatro
+Ejecuta los **siete casos en paralelo**; dentro de cada caso consulta los cuatro
 nodos secuencialmente y publica su tabla en
 **172.19.242.107 / elog**. No requiere pandas ni dependencias adicionales a las
 que ya utiliza el driver. No instala ni actualiza paquetes del env.
@@ -21,11 +21,14 @@ Copiar el contenido de `apps/` del repositorio a la carpeta `apps/` del servidor
       credentials.env.example
       sql/
         01_crear_tablas.sql
+        02_agregar_casos_observados.sql
         pool_ips.sql
         pool_ips_privadas.sql
         carga_nat_hora.sql
         abuso_smtp.sql
         puertos_mas_usados.sql
+        observaciones_router_hora.sql
+        comparticion_publica_hora.sql
       tests/test_etl.py
   conf/cgnat_etl.env                 # credenciales locales, permisos 600
   env/bin/activate                   # entorno existente
@@ -97,12 +100,18 @@ Crear las tablas ejecutando **sql/01_crear_tablas.sql en el destino**, o mediant
 /bin/sh /index1/tareas/proyectos_python/apps/run_cgnat_etl.sh --init-db
 ```
 
-`--init-db` solamente conecta al destino, crea `elog` y sus cinco tablas y sale.
+`--init-db` solamente conecta al destino, crea `elog` y sus siete tablas y sale.
 Los orígenes necesitan permiso `SELECT` sobre las tablas diarias. El usuario
 destino necesita `SELECT`, `INSERT`, `CREATE TABLE`, `DROP TABLE` y las operaciones
 `ALTER ... REPLACE/DROP PARTITION` en las tablas del ETL; para inicializar también
 necesita crear la base si no existe. El administrador puede ejecutar el DDL antes.
 Las tablas auxiliares se crean en `elog` con prefijo `_cgnat_etl_`.
+
+Para actualizar una instalación existente, desplegar `main.py` y los dos nuevos
+SELECT, y ejecutar `sql/02_agregar_casos_observados.sql` en el destino. También
+se puede volver a ejecutar `--init-db`: utiliza `CREATE TABLE IF NOT EXISTS`.
+No requiere cambios en el INI ni en el shell. Crear las tablas nuevas antes de
+la siguiente carga con todos los casos.
 
 ## Ejecución y cron
 
@@ -141,14 +150,14 @@ Reprocesar solamente un caso, o consultar otra IP pública:
 /bin/sh /index1/tareas/proyectos_python/apps/run_cgnat_etl.sh --fecha 2026-08-01 --caso pool_ips_privadas --public-ip 179.6.75.138
 ```
 
-Sin `--caso` (o con `--caso todos`), los cinco casos arrancan en paralelo,
+Sin `--caso` (o con `--caso todos`), los siete casos arrancan en paralelo,
 con un hilo de Python dedicado a cada caso. Cada uno recorre los nodos
 `132 -> 133 -> 134 -> 135` en secuencia, usando conexiones propias tanto
 para los orígenes como para el destino. No hay pool de workers ni tareas
 paralelas por nodo dentro de un caso. Con `--caso nombre` se ejecuta solo ese caso.
 No se requieren cambios en el `config.ini`, shell o cron existentes para este modo.
 
-Puede haber hasta **cinco consultas de extracción simultáneas**, incluso todas
+Puede haber hasta **siete consultas de extracción simultáneas**, incluso todas
 en el mismo nodo. `max_threads = 2` se aplica a cada consulta, no al conjunto
 del ETL. Este paralelismo puede competir con el Go Collector por CPU, RAM y
 disco en los nodos origen. No constituye un límite de recursos reservado para
@@ -197,17 +206,58 @@ modificar la raíz de despliegue y `CGNAT_ENV_FILE` la ruta de credenciales.
 | `cgnat_carga_nat_hora` | Sesiones y abonados por hora e IP pública |
 | `cgnat_abuso_smtp` | Top 10 000 por nodo hacia puerto 25 |
 | `cgnat_puertos_mas_usados` | Métricas por IP pública y puerto de la lista indicada |
+| `cgnat_observaciones_router_hora` | Registros e IP privadas, públicas y destinos distintos aproximados por hora y router |
+| `cgnat_comparticion_publica_hora` | Top 200 por nodo de grupos hora/IP pública según orígenes observados aproximados |
 
 Cada fila incluye `fecha_datos` (fecha de la tabla origen), `nodo_origen` (host)
 y `fecha_carga` (UTC). Se conservan IPv4 y contadores UInt64. `hour` conserva el
 instante de `toStartOfHour(start_time)` del origen y se almacena en UTC; consultar
 `toTimeZone(hour, 'America/Lima')` para presentación local. Las zonas de los
-orígenes deben representar correctamente sus datos. No se aplica otro filtro
-de tiempo además de seleccionar la tabla diaria.
+orígenes deben representar correctamente sus datos. En los cinco casos originales
+no se aplica otro filtro de tiempo además de seleccionar la tabla diaria.
+
+### Nuevos casos: observaciones y compartición
+
+`observaciones_router_hora` cuenta registros y utiliza `uniqCombined64` para
+estimar IP privadas, públicas y destinos por hora/router. **No mide usuarios
+simultáneos ni sesiones concurrentes**. Cada IP se cuenta dentro del intervalo
+horario observado, sin comprobar solapamiento de sus registros.
+
+`comparticion_publica_hora` estima los pares `(router_ip, private_ip)` por
+hora/IP pública, cuenta routers exactamente y cuenta registros. Conserva el
+`LIMIT 200` de la consulta solicitada: selecciona los 200 grupos con mayor
+compartición observada **del día completo de cada nodo**, no 200 por hora ni un
+top global del clúster. Con cuatro nodos hay hasta 800 filas por fecha. Ante
+empates, se ordena adicionalmente por hora e IP pública. La tabla final no
+conserva el orden de inserción: para mostrar el ranking consultar con
+`ORDER BY origenes_observados_aprox DESC`.
+
+Ambas consultas filtran `start_time >= inicio AND start_time < fin`. El inicio
+es medianoche del día solicitado y el fin medianoche del siguiente, interpretados
+explícitamente en `America/Lima`. Con `--fecha 2026-10-16` consultan
+`cgnat.huawei_cgn_nat_v2_2026_10_16` y el rango local
+`[2026-10-16 00:00:00, 2026-10-17 00:00:00)`. Sin `--fecha` usan ayer.
+La columna `hora` de las dos tablas nuevas es `DateTime('America/Lima')`;
+Python transmite su instante como epoch para evitar conversiones por la zona
+del sistema. No utilizan el parámetro `public_ip` del INI.
+
+Prueba individual desde la carpeta de la aplicación, con env/credenciales cargados:
+
+```sh
+python3 main.py --fecha 2026-10-16 --caso observaciones_router_hora
+python3 main.py --fecha 2026-10-16 --caso comparticion_publica_hora
+# Solo mostrar SQL y parámetros, sin conectar:
+python3 main.py --config config.example.ini --fecha 2026-10-16 --caso comparticion_publica_hora --dry-run
+```
+
+Los estimados de `uniqCombined64`, igual que los únicos exactos, se conservan por
+nodo y no deben sumarse para estimar únicos globales. Para un cálculo global se
+necesitarían los datos conjuntos o estados agregados combinables, no solo conteos.
 
 Las consultas respetan los agregados indicados. Los volúmenes mencionados son
-estimaciones, no límites; únicamente SMTP limita a 10 000 **en cada nodo**, por
-lo que puede producir hasta 40 000 filas en destino. Sus empates se ordenan por
+estimaciones, no límites; SMTP limita a 10 000 **en cada nodo**, por
+lo que puede producir hasta 40 000 filas en destino. Compartición pública limita
+a 200 por nodo, como se describe arriba. Los empates de SMTP se ordenan por
 IP para que el top sea reproducible. Se eliminó el 3478 repetido de la lista,
 sin cambiar el filtro. `bytes_totales` mantiene `sum(packet_size)` exactamente:
 representa esa columna, no una estimación adicional de tráfico de sesiones.
@@ -225,7 +275,7 @@ cantidad insertada se publica con
 [`REPLACE PARTITION`](https://clickhouse.com/docs/reference/statements/alter/partition).
 Esta sustitución es atómica **por caso/partición**: repetir una fecha reemplaza
 el resultado previo y elimina también grupos que ya no existen. No hay una
-transacción común para las cinco tablas. Un caso fallido devuelve código 1 y
+transacción común para las siete tablas. Un caso fallido devuelve código 1 y
 permite que los restantes se intenten; repetir la fecha o el caso para recuperar.
 
 La partición es el día; para IPs privadas es **(día, IP pública consultada)**,
@@ -247,7 +297,7 @@ avanzan en paralelo. `max_threads`, `max_execution_time`, timeouts y lotes son
 configurables. Los bloques acotan
 el buffer Python; `uniqExact` sigue necesitando memoria en ClickHouse según la
 cardinalidad. Programar sobre tablas con ingestión terminada: la lectura de
-cuatro servidores y cinco casos no constituye un snapshot transaccional global.
+cuatro servidores y siete casos no constituye un snapshot transaccional global.
 
 ## Verificación
 
@@ -259,8 +309,10 @@ python3 -m unittest discover -s tests -v
 
 Cubren los cuatro nodos, fallos de lectura/escritura, lotes, recargas, vacíos,
 particiones por IP, fechas/zonas horarias y generación de consultas. También
-verifican la concurrencia real de los cinco casos, el orden de sus nodos,
+verifican la concurrencia real de los siete casos, el orden de sus nodos,
 la independencia y cierre de conexiones y el aislamiento de fallos entre casos.
+Incluyen las ventanas diarias de Lima (con cambios de mes/año), la conversión
+de horas, las columnas de las tablas nuevas y sus parámetros de consulta.
 En el servidor, crear las tablas y ejecutar una carga controlada antes de
 habilitar cron. Comparar conteos por nodo y fecha, por ejemplo:
 

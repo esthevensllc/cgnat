@@ -28,7 +28,13 @@ CASES = {
     "abuso_smtp": ("private_ip", "public_ip", "destination_ip", "sesiones", "bytes_totales"),
     "puertos_mas_usados": ("public_ip", "destination_port", "sesiones",
                           "bytes_totales", "abonados_distintos"),
+    "observaciones_router_hora": ("hora", "router_ip", "registros", "ips_privadas_aprox",
+                                  "ips_publicas_aprox", "destinos_aprox"),
+    "comparticion_publica_hora": ("hora", "public_ip", "origenes_observados_aprox",
+                                 "routers", "registros"),
 }
+DAILY_WINDOW_CASES = frozenset(("observaciones_router_hora", "comparticion_publica_hora"))
+HOURLY_CASES = DAILY_WINDOW_CASES | {"carga_nat_hora"}
 
 
 class AlreadyRunning(Exception):
@@ -142,6 +148,16 @@ def query_for(case, table):
     return (ROOT / "sql" / (case + ".sql")).read_text(encoding="utf-8").format(source_table=table)
 
 
+def query_parameters(case, data_date, public_ip):
+    if case == "pool_ips_privadas":
+        return {"public_ip": public_ip}
+    if case in DAILY_WINDOW_CASES:
+        # Las cadenas se interpretan explicitamente como America/Lima en el SQL.
+        return {"inicio": data_date.isoformat() + " 00:00:00",
+                "fin": (data_date + timedelta(days=1)).isoformat() + " 00:00:00"}
+    return None
+
+
 def partition_for(case, data_date, public_ip):
     # Valores validados, no texto libre interpolado en DDL.
     day = "'{}'".format(data_date.isoformat())
@@ -154,7 +170,7 @@ def prepare_row(case, row, data_date, node, loaded_at, public_ip):
     values = list(row)
     if case == "pool_ips_privadas":
         values.insert(0, public_ip)
-    if case == "carga_nat_hora":
+    if case in HOURLY_CASES:
         # query_tz='UTC' controla la conversion del driver. Insertar epoch evita
         # que un datetime naive sea reinterpretado en la zona del proceso Linux.
         hour = values[0]
@@ -174,7 +190,7 @@ def load_case(destination, sources, config, case, data_date, public_ip):
     process = config["proceso"]
     batch_size = process.getint("batch_size")
     query = query_for(case, source_table(config, data_date))
-    parameters = {"public_ip": public_ip} if case == "pool_ips_privadas" else None
+    parameters = query_parameters(case, data_date, public_ip)
     columns = list(META + CASES[case])
     loaded_at = int(time.time())
     total = 0
@@ -236,7 +252,7 @@ def initialize(destination):
     for statement in sql.split(";"):
         if statement.strip():
             destination.command(statement.strip())
-    LOG.info("Esquema elog y cinco tablas inicializados")
+    LOG.info("Esquema elog y %d tablas inicializados", len(CASES))
 
 
 def open_client(stack, factory, options, name, case):
@@ -326,6 +342,9 @@ def main(argv=None):
             for case in cases:
                 print("\n-- {} -> elog.cgnat_{}\n{}".format(
                     case, case, query_for(case, source_table(config, args.fecha))))
+                parameters = query_parameters(case, args.fecha, public_ip)
+                if parameters:
+                    print("-- Parametros: {}".format(parameters))
             return 0
         import clickhouse_connect
         with process_lock():

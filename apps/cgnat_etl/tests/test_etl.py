@@ -183,13 +183,86 @@ class EtlTests(unittest.TestCase):
         self.assertIn("destino=172.19.242.107:8123 usuario=nifi base=ookla", messages)
         self.assertNotIn("local-secret", messages)
 
-    def test_initialization_has_five_tables_and_database(self):
+    def test_initialization_has_seven_tables_and_database(self):
         destination = Destination()
         etl.initialize(destination)
-        self.assertEqual(len(destination.commands), 6)
+        self.assertEqual(len(destination.commands), 8)
         for case in etl.CASES:
             self.assertTrue(any("CREATE TABLE IF NOT EXISTS elog.cgnat_" + case in c
                                 for c in destination.commands))
+
+    def test_observed_cases_bind_day_bounds_including_month_and_leap_year_rollover(self):
+        for case in etl.DAILY_WINDOW_CASES:
+            for day, next_day in [(date(2026, 10, 16), "2026-10-17"),
+                                  (date(2026, 12, 31), "2027-01-01"),
+                                  (date(2024, 2, 29), "2024-03-01")]:
+                self.assertEqual(etl.query_parameters(case, day, IP), {
+                    "inicio": day.isoformat() + " 00:00:00",
+                    "fin": next_day + " 00:00:00"})
+
+    def test_observed_cases_keep_requested_time_filters_and_aggregation_semantics(self):
+        for case in etl.DAILY_WINDOW_CASES:
+            query = etl.query_for(case, "cgnat.huawei_cgn_nat_v2_2026_10_16")
+            self.assertIn("toDateTime(%(inicio)s, 'America/Lima')", query)
+            self.assertIn("toDateTime(%(fin)s, 'America/Lima')", query)
+            self.assertIn("toStartOfHour(start_time, 'America/Lima') AS hora", query)
+            self.assertIn("start_time >= inicio", query)
+            self.assertIn("start_time < fin", query)
+            self.assertNotIn("2026-10-16 00:00:00", query)
+        shared = etl.query_for("comparticion_publica_hora", "cgnat.t")
+        self.assertIn("uniqCombined64(tuple(router_ip, private_ip))", shared)
+        self.assertIn("uniqExact(router_ip) AS routers", shared)
+        self.assertIn("GROUP BY hora, public_ip", shared)
+        self.assertIn("LIMIT 200", shared)
+        self.assertNotIn("LIMIT 200 BY", shared)
+        observed = etl.query_for("observaciones_router_hora", "cgnat.t")
+        self.assertIn("uniqCombined64(private_ip) AS ips_privadas_aprox", observed)
+        self.assertIn("GROUP BY hora, router_ip", observed)
+        self.assertNotIn("LIMIT", observed)
+
+    def test_new_hour_columns_preserve_lima_midnight_as_epoch(self):
+        local = datetime(2026, 10, 16, tzinfo=etl.LIMA)
+        utc = datetime(2026, 10, 16, 5, tzinfo=timezone.utc)
+        for case in etl.DAILY_WINDOW_CASES:
+            for hour in [local, utc, utc.replace(tzinfo=None)]:
+                values = [hour] + [1] * (len(etl.CASES[case]) - 1)
+                row = etl.prepare_row(case, values, local.date(), "n1", 1, IP)
+                self.assertEqual(row[3], int(local.timestamp()))
+
+    def test_observed_cases_load_four_sources_with_bound_window_and_metadata(self):
+        day = date(2026, 10, 16)
+        for case in etl.DAILY_WINDOW_CASES:
+            hour = datetime(2026, 10, 16, tzinfo=etl.LIMA)
+            values = (hour, IP, 100, 20, 30, 40) if case == "observaciones_router_hora" else (
+                hour, IP, 20, 2, 100)
+            sources = [("origen_" + str(i), Source([[values]])) for i in range(1, 5)]
+            destination = Destination()
+            self.assertEqual(etl.load_case(destination, sources, self.config, case, day, IP), 4)
+            for _, client in sources:
+                self.assertEqual(client.options["parameters"], {
+                    "inicio": "2026-10-16 00:00:00", "fin": "2026-10-17 00:00:00"})
+                self.assertIn("cgnat.huawei_cgn_nat_v2_2026_10_16", client.query)
+            for _, batch, columns in destination.batches:
+                self.assertEqual(columns, list(etl.META + etl.CASES[case]))
+                self.assertEqual(batch[0][0], day)
+                self.assertEqual(batch[0][3], int(hour.timestamp()))
+            self.assertIn("REPLACE PARTITION '2026-10-16'", destination.commands[-2])
+
+    def test_new_tables_migration_matches_full_schema(self):
+        full = (etl.ROOT / "sql" / "01_crear_tablas.sql").read_text(encoding="utf-8")
+        migration = (etl.ROOT / "sql" / "02_agregar_casos_observados.sql").read_text(encoding="utf-8")
+        marker = "-- Observaciones por hora/router"
+        self.assertEqual(full[full.index(marker):].strip(), migration[migration.index(marker):].strip())
+
+    def test_new_case_cli_dry_run_prints_selected_date_bounds(self):
+        for case in etl.DAILY_WINDOW_CASES:
+            with patch("builtins.print") as output:
+                self.assertEqual(etl.main(["--config", str(etl.ROOT / "config.example.ini"),
+                                           "--fecha", "2026-10-16", "--caso", case, "--dry-run"]), 0)
+            rendered = "\n".join(str(call[0][0]) for call in output.call_args_list)
+            self.assertIn("cgnat.huawei_cgn_nat_v2_2026_10_16", rendered)
+            self.assertIn("2026-10-16 00:00:00", rendered)
+            self.assertIn("2026-10-17 00:00:00", rendered)
 
     def test_default_date_is_previous_day_in_lima(self):
         # A las 00:30 UTC del 10 aun es 9 en Lima: debe consultar el dia 8.
@@ -230,6 +303,8 @@ class ParallelCaseTests(unittest.TestCase):
             "carga_nat_hora": (1785542400, IP, 9, 2),
             "abuso_smtp": ("10.0.0.1", IP, "8.8.8.8", 9, 100),
             "puertos_mas_usados": (IP, 443, 9, 100, 2),
+            "observaciones_router_hora": (datetime(2026, 8, 1, tzinfo=etl.LIMA), IP, 9, 3, 2, 4),
+            "comparticion_publica_hora": (datetime(2026, 8, 1, tzinfo=etl.LIMA), IP, 3, 2, 9),
         }
         clients, destinations = [], {}
         visits = {case: [] for case in cases}
@@ -303,11 +378,11 @@ class ParallelCaseTests(unittest.TestCase):
                 self.assertEqual(sum(len(b[1]) for b in destinations[case].batches), 4)
         return status, clients
 
-    def test_five_cases_overlap_with_independent_clients_and_sequential_nodes(self):
+    def test_seven_cases_overlap_with_independent_clients_and_sequential_nodes(self):
         status, clients = self.simulate(list(etl.CASES))
         self.assertEqual(status, 0)
-        self.assertEqual(len(clients), 25)
-        self.assertEqual(len({client.owner for client in clients}), 5)
+        self.assertEqual(len(clients), 35)
+        self.assertEqual(len({client.owner for client in clients}), 7)
 
     def test_read_failure_preserves_other_case_publications(self):
         status, _ = self.simulate(list(etl.CASES), failed_read="pool_ips")
@@ -316,7 +391,11 @@ class ParallelCaseTests(unittest.TestCase):
     def test_connection_failure_closes_open_clients_and_other_cases_complete(self):
         status, clients = self.simulate(list(etl.CASES), failed_connection="abuso_smtp")
         self.assertEqual(status, 1)
-        self.assertEqual(len(clients), 23)
+        self.assertEqual(len(clients), 33)
+
+    def test_new_case_failure_preserves_other_six_publications(self):
+        status, _ = self.simulate(list(etl.CASES), failed_read="comparticion_publica_hora")
+        self.assertEqual(status, 1)
 
     def test_single_selected_case_opens_only_its_own_connections(self):
         status, clients = self.simulate(["pool_ips_privadas"])
