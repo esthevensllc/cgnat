@@ -499,6 +499,13 @@ watch -n 2 /usr/local/bin/monitor-cgn.sh \
   /index2/huawei-cgn-go/alerts
 ```
 
+## Captura de 15 minutos en produccion
+
+Para registrar recepcion, parseo, insercion, drops y colas en los cuatro
+servidores sin reiniciar ni recompilar, ver la
+[captura de metricas de 15 minutos](docs/runbooks/captura-metricas-15-minutos.md).
+Genera un resumen y un CSV usando los contadores existentes del collector.
+
 ## Alertas
 
 | Nombre | Se activa cuando |
