@@ -73,16 +73,26 @@ grep -Eq 'Registros parseados/serializados +10000000000$' "$TEST_DIR/large.txt"
 
 # Exercise the complete capture with fake system services, never a real collector.
 export CGN_CAPTURE_FIXTURE="$TEST_DIR/service.log"
+export CGN_BASELINE_FIXTURE="$TEST_DIR/baseline.log"
 now="$(date +%s)"
 sample "$((now-10)).000000" 1000 1000 2000 2000 0 > "$CGN_CAPTURE_FIXTURE"
 sample "$now.000000" 2000 2000 4000 4000 0 >> "$CGN_CAPTURE_FIXTURE"
+sample "$((now-50)).000000" 500 500 1000 1000 0 > "$CGN_BASELINE_FIXTURE"
+sample "$((now-10)).000000" 1000 1000 2000 2000 0 >> "$CGN_BASELINE_FIXTURE"
 systemctl() {
   if [[ "$1" == is-active ]]; then return 0; fi
   printf 'MainPID=123\nInvocationID=test-invocation\nActiveState=active\n'
 }
 journalctl() {
-  if [[ " $* " == *' -n 1 '* ]]; then head -n 1 "$CGN_CAPTURE_FIXTURE"
-  else /usr/bin/cat "$CGN_CAPTURE_FIXTURE"; fi
+  if [[ "${CGN_TEST_JOURNAL_DENIED:-0}" == 1 ]]; then
+    echo 'No journal files were opened due to insufficient permissions.' >&2
+    return 1
+  fi
+  # Retain the legacy header deliberately, even if the caller requests --quiet.
+  printf '%s\n' '-- Logs begin at Mon 2026-07-20 16:29:51 -05, end at Wed 2026-10-21 14:32:57 -05. --'
+  if [[ "${CGN_TEST_NO_METRICS:-0}" == 1 ]]; then return 0; fi
+  if [[ " $* " == *' --until '* ]]; then /usr/bin/cat "$CGN_CAPTURE_FIXTURE"
+  else /usr/bin/cat "$CGN_BASELINE_FIXTURE"; fi
 }
 ss() { echo 'State Recv-Q Send-Q Local Address:Port Peer Address:Port'; }
 hostname() { echo test-collector; }
@@ -102,6 +112,22 @@ capture_dir="$(find "$TEST_DIR/results" -mindepth 1 -maxdepth 1 -type d)"
 grep -Eq 'Registros parseados/serializados +2000$' "$capture_dir/summary.txt"
 grep -q 'RcvbufErrors delta=0' "$capture_dir/udp-summary.txt"
 grep -q 'NO_DISPONIBLE: directorio ausente' "$capture_dir/spool-summary.txt"
+grep -q "^$((now-10)).000000 " "$capture_dir/baseline.log"
+if grep -q '^-- Logs begin' "$capture_dir/collector.log"; then
+  echo 'El informe no debe conservar cabeceras del journal.' >&2
+  exit 1
+fi
 rm -f -- "$capture_dir"/*
 rmdir -- "$capture_dir" "$TEST_DIR/results"
-echo 'OK: captura completa, unidades, saldos, spool, reinicios, journal incompleto, CSV y contadores grandes.'
+
+code=0
+CGN_TEST_JOURNAL_DENIED=1 bash "$DEPLOY_DIR/capture-cgn-metrics.sh" huawei-cgn-go 1 9088 \
+  "$TEST_DIR/denied-results" > "$TEST_DIR/denied.txt" 2>&1 || code=$?
+[[ "$code" == 1 && ! -e "$TEST_DIR/denied-results" ]]
+grep -q 'No se pudo leer el journal' "$TEST_DIR/denied.txt"
+code=0
+CGN_TEST_NO_METRICS=1 bash "$DEPLOY_DIR/capture-cgn-metrics.sh" huawei-cgn-go 1 9088 \
+  "$TEST_DIR/empty-results" > "$TEST_DIR/no-metrics.txt" 2>&1 || code=$?
+[[ "$code" == 1 && ! -e "$TEST_DIR/empty-results" ]]
+grep -q 'No hay metricas recientes' "$TEST_DIR/no-metrics.txt"
+echo 'OK: captura completa, cabecera journal, muestra mas reciente, permisos, unidades, saldos, spool, reinicios, CSV.'

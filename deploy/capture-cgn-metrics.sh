@@ -32,15 +32,24 @@ done
 systemctl is-active --quiet "$SERVICE" || { echo "Servicio inactivo: $SERVICE" >&2; exit 1; }
 
 START="$(date +%s)"
-BASELINE="$(journalctl -u "$SERVICE" -b --since "@$((START - 60))" \
-  -n 1 --no-pager -l -o short-unix --grep='metrics .*live_batch_mode=')"
+if ! BASELINE="$(journalctl -u "$SERVICE" -b --since "@$((START - 60))" \
+  --quiet --no-pager -l -o short-unix --grep='metrics .*live_batch_mode=' \
+  | awk '$1 ~ /^[0-9]+([.][0-9]+)?$/ && /metrics .*live_batch_mode=/ {
+      if (!found || $1+0 >= newest) { newest=$1+0; line=$0; found=1 }
+    } END { if (found) print line }')"; then
+  echo "No se pudo leer el journal de $SERVICE. Verificar permisos y ejecutar con sudo si es necesario." >&2
+  exit 1
+fi
 [[ "$BASELINE" == *'total_received='* ]] || {
   echo "No hay metricas recientes. Verificar servicio y permisos de journalctl (ejecutar con sudo)." >&2
   exit 1
 }
-BASELINE_SECOND="${BASELINE%%.*}"
 BASELINE_TIME="${BASELINE%% *}"
-[[ "$BASELINE_SECOND" =~ ^[0-9]+$ ]] || exit 1
+BASELINE_SECOND="${BASELINE_TIME%%.*}"
+[[ "$BASELINE_SECOND" =~ ^[0-9]+$ ]] || {
+  echo "Marca de tiempo no valida en la muestra inicial de journalctl." >&2
+  exit 1
+}
 mkdir -p -- "$OUTPUT_BASE"
 OUT="$(mktemp -d "$OUTPUT_BASE/$(hostname -s)_$(date -u +%Y%m%dT%H%M%SZ)_XXXXXX")"
 printf '%s\n' "$BASELINE" > "$OUT/baseline.log"
@@ -85,9 +94,14 @@ snapshot end
 echo "fin=$(date --iso-8601=seconds)" >> "$OUT/context.txt"
 
 # Retain metrics and a restart marker without logging configuration or credentials.
-journalctl -u "$SERVICE" --since "@$BASELINE_SECOND" --until "@$END" \
-  --no-pager -l -o short-unix --grep='metrics .*live_batch_mode=|collector_started' \
-  | awk '/collector_started/ { print $1, "collector_started"; next } { print }' > "$OUT/collector.log"
+if ! journalctl -u "$SERVICE" --since "@$BASELINE_SECOND" --until "@$END" \
+  --quiet --no-pager -l -o short-unix --grep='metrics .*live_batch_mode=|collector_started' \
+  | awk '$1 !~ /^[0-9]+([.][0-9]+)?$/ { next }
+      /collector_started/ { print $1, "collector_started"; next }
+      /metrics .*live_batch_mode=/ { print }' > "$OUT/collector.log"; then
+  echo "No se pudo recuperar el journal final. Evidencia parcial: $OUT" >&2
+  exit 1
+fi
 
 INVALID=0
 if ! cmp -s "$OUT/service.start.txt" "$OUT/service.end.txt" || \

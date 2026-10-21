@@ -46,6 +46,13 @@ formato. Si el usuario no tiene escritura en `/opt`, puede copiar ambos
 archivos a un directorio propio, corregir alli las lineas y ejecutar desde ese
 directorio. Aun necesitara acceso al journal y una ruta de resultados escribible.
 
+Si una copia anterior vuelve al prompt sin mostrar `Capturando`, y `bash -x`
+muestra `BASELINE_SECOND='-- Logs begin ...'`, actualizar
+`capture-cgn-metrics.sh`: algunas versiones de journalctl imprimen una cabecera
+antes de los datos. La version actual la suprime, filtra solo muestras con una
+marca de tiempo valida y selecciona la mas reciente de los ultimos 60 segundos.
+No es necesario recompilar ni reiniciar el collector.
+
 El script toma una muestra previa y la ultima disponible al terminar. El periodo
 efectivo se imprime en el resumen: puede diferir algunos segundos de 900 porque
 el collector publica metricas cada 10 s. Los snapshots de kernel y spool tienen
