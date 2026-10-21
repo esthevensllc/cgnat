@@ -1,0 +1,4 @@
+# Keep the production metrics tools runnable after a Windows checkout/upload.
+/deploy/capture-cgn-metrics.sh text eol=lf
+/deploy/summarize-cgn-metrics.awk text eol=lf
+/deploy/tests/test-capture-cgn-metrics.sh text eol=lf

@@ -27,6 +27,25 @@ Argumentos opcionales, en orden: servicio, segundos, puerto UDP, directorio de
 resultados y `FAILED_SPOOL_BASE`. Si las rutas o el nombre del servicio difieren,
 ajustarlos; no se lee ni se ejecuta el archivo `.env`.
 
+Si al ejecutar aparece `set: pipefail: invalid option name`, comprobar los
+finales de linea con `head -n 4 ARCHIVO | cat -A`: un `^M` al final indica CRLF
+de Windows. Bash necesita LF. Para corregir ambos archivos, con un usuario que
+tenga permiso de escritura sobre ellos:
+
+```bash
+sed -i 's/\r$//' \
+  /opt/huawei-cgn-go/deploy/capture-cgn-metrics.sh \
+  /opt/huawei-cgn-go/deploy/summarize-cgn-metrics.awk
+
+bash -n /opt/huawei-cgn-go/deploy/capture-cgn-metrics.sh
+```
+
+Luego repetir la captura. El repositorio fija `eol=lf` para estas herramientas;
+al copiarlas por SFTP/WinSCP usar transferencia binaria para conservar ese
+formato. Si el usuario no tiene escritura en `/opt`, puede copiar ambos
+archivos a un directorio propio, corregir alli las lineas y ejecutar desde ese
+directorio. Aun necesitara acceso al journal y una ruta de resultados escribible.
+
 El script toma una muestra previa y la ultima disponible al terminar. El periodo
 efectivo se imprime en el resumen: puede diferir algunos segundos de 900 porque
 el collector publica metricas cada 10 s. Los snapshots de kernel y spool tienen
